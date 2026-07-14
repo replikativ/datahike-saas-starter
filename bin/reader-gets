@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Measure ACTUAL GETs per deref for a Tier-3 (direct-S3, non-streaming) reader,
+# via MinIO's request trace.
+#
+# Tier 3's whole premise is that a non-streaming `@conn` re-reads the branch head
+# from the store, so a stateless reader auto-follows the writer with no sync. If
+# that is true, each deref must cost at least one GET. In-process timing CANNOT tell you
+# this: datahike caches connections on [store-id, branch], so a "reader" opened in the same
+# JVM as the writer is handed the writer's own connection and reports sub-millisecond reads
+# with zero S3 traffic — looking great while proving nothing. The trace is ground truth.
+#
+# Brackets a trace around N and 2N derefs and takes the marginal difference, so
+# connect/warmup GETs cancel and what's left is the per-deref cost.
+#
+#   docker compose --profile tier1 up -d     # MinIO on :9000
+#   bin/reader-gets                          # N defaults to 20
+#
+# Requires docker (uses minio/mc trace against the running MinIO). MinIO-only, by
+# construction — against a real bucket, read GETs/deref off your provider's request
+# metrics instead.
+set -euo pipefail
+
+N="${N:-20}"
+OUT="$(mktemp -d -p "${TMPDIR:-$HOME/tmp}" reader-gets.XXXXXX)"
+
+docker rm -f saas-gettrace >/dev/null 2>&1 || true
+docker run -d --name saas-gettrace --network host -v "$OUT:/out" --entrypoint sh minio/mc:latest \
+  -c "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null 2>&1 && mc admin trace --json --call s3 local >/out/trace.json 2>/dev/null" >/dev/null
+sleep 4
+
+UUID_RE='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+declare -A SID
+for M in "$N" "$((2 * N))"; do
+  echo "  running $M derefs..." >&2
+  SID["$M"]=$(MINIO_PORT=9000 SAAS_TIER=tier1 clojure -M:bench -m datahike-saas.reader-gets "$M" 2>/dev/null \
+              | grep "STOREID" | grep -oE "$UUID_RE" | head -1)
+done
+
+sleep 2; docker stop saas-gettrace >/dev/null 2>&1
+
+TRACE="$OUT/trace.json"
+
+# Fail LOUD, for the same reason bin/put-count does. A missing trace, or an empty store id
+# (the bench died before printing STOREID, so `grep -c ""` would match EVERY line and the two
+# runs would cancel), both yield a serene 0.00 GETs/deref — which reads as "a Tier-3 reader
+# costs zero object-store reads", the most flattering possible way to be broken.
+if [[ ! -s "$TRACE" ]]; then
+  echo "ERROR: no MinIO trace at $TRACE — the mc container could not write to the host." >&2
+  echo "       (Is MinIO up on :9000? Can docker bind-mount \$HOME?)" >&2
+  rm -rf "$OUT"; exit 1
+fi
+for M in "$N" "$((2 * N))"; do
+  if [[ -z "${SID[$M]:-}" ]]; then
+    echo "ERROR: the $M-deref benchmark never printed a STOREID — it failed to run." >&2
+    echo "       Not reporting a GET count for a run that did not happen." >&2
+    rm -rf "$OUT"; exit 1
+  fi
+done
+if ! grep -q '"api":"s3.GetObject"' "$TRACE"; then
+  echo "ERROR: trace captured $(wc -l < "$TRACE") lines but ZERO GetObject calls." >&2
+  echo "       The reader read nothing, or the trace missed it. Not reporting 0." >&2
+  rm -rf "$OUT"; exit 1
+fi
+
+gets() { grep '"api":"s3.GetObject"' "$TRACE" | grep -c "$1" || true; }
+a=$(gets "${SID[$N]}"); b=$(gets "${SID[$((2 * N))]}")
+echo
+printf "  GETs @ %2d derefs: %s\n" "$N" "$a"
+printf "  GETs @ %2d derefs: %s\n" "$((2 * N))" "$b"
+printf "  => MARGINAL GETs/deref: %s\n" "$(echo "scale=2;($b-$a)/$N" | bc)"
+rm -rf "$OUT"

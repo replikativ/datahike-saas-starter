@@ -1,0 +1,103 @@
+;; Tier 1 (local MinIO) benchmark results.
+;; Env: local MinIO (minio/minio:latest), GraalVM JDK 25, single node.
+;; Stack: datahike 0.8.1730, konserve-s3 0.1.35, konserve 0.9.358, konserve-sync 0.1.36.
+;; Reproduce: SAAS_TIER=tier1 clj -M:bench -m datahike-saas.workload <bench> <opts>
+
+{;; PUTs/commit — cost/latency metric, from MinIO trace (bin/put-count), single-issue
+ ;; commits, marginal (PUT@40-PUT@20)/20.
+ :puts-per-commit
+ {:economical 1.00 :no-diff-buf 1.00 :with-commit-graph 2.00 :no-fusion 4.00}
+
+ ;; Net stored-object growth — storage/GC metric, in-process key-set delta over 300
+ ;; MIXED commits (workload compare). NOT PUTs/commit (branch head is a fixed-key overwrite).
+ :compare
+ {:opts {:commits 300}
+  :rows [{:variant :economical        :object-growth 61   :growth-per-commit 0.20 :write-ms {:p50 31.05 :p99 63.57 :mean 31.43}}
+         {:variant :no-diff-buf       :object-growth 1516 :growth-per-commit 5.05 :write-ms {:p50 35.59 :p99 66.09 :mean 38.05}}
+         {:variant :no-fusion         :object-growth 962  :growth-per-commit 3.21 :write-ms {:p50 32.93 :p99 102.96 :mean 39.45}}
+         {:variant :with-commit-graph :object-growth 361  :growth-per-commit 1.20 :write-ms {:p50 23.49 :p99 44.79 :mean 24.82}}
+         {:variant :full-history      :object-growth 434  :growth-per-commit 1.45 :write-ms {:p50 27.84 :p99 57.48 :mean 28.53}}]}
+
+ :mixed
+ {:opts {:tenants 20 :target-rate 200 :duration-s 20 :read-frac 0.9}
+  :achieved-rate 199.7 :completed 4000
+  :by-tag {:read  {:count 3619 :p50 1.97 :p90 5.13  :p99 30.56 :p999 54.39}
+           :write {:count 381  :p50 31.05 :p90 46.07 :p99 65.99 :p999 84.67}}}
+
+ :mixed-many                            ; 200 concurrent tenants, Zipf skew — one node
+ {:sustained {:opts {:tenants 200 :skew 1.0 :target-rate 120 :read-frac 0.9} :achieved 119.5
+              :read  {:p50 2.93 :p90 19.17 :p99 35.65 :p999 77.33}
+              :write {:p50 36.50 :p90 70.19 :p99 128.71 :p999 144.57}}
+  :saturated {:opts {:tenants 200 :skew 1.0 :target-rate 300 :read-frac 0.9} :achieved 292.9
+              :read  {:p50 375.91 :p99 1431.31}   ; single-node ceiling -> Tier 3
+              :write {:p50 714.08 :p99 1261.44}}}
+
+ :gc
+ {:opts {:issues 50 :churn 800 :variant :no-diff-buf}
+  :objects-before 2440 :objects-after 7 :reclaimed 2433 :reclaimed-pct 99.71 :gc-ms 14680.2}
+
+ :http                                  ; end-to-end through Jetty + JSON (separate client)
+ {:opts {:tenants 20 :target-rate 200 :duration-s 20 :read-frac 0.9}
+  :achieved-rate 199.6 :completed 4000
+  :by-tag {:read  {:count 3612 :p50 3.52  :p90 21.50 :p99 296.22 :p999 558.89}
+           :write {:count 388  :p50 48.01 :p90 85.59 :p99 339.74 :p999 345.24}}}
+
+ :scale                                 ; many tenants on one node
+ {:opts {:tenants 1000 :issues-per 5}
+  :heap-mb-per-tenant 0.089 :total-heap-mb 132 :objects-per-tenant 8
+  :connect-ms {:p50 157.5 :p90 212.9 :p99 291.2 :p999 398.5}
+  :seed-s 304.9 :tenants-per-s 3.28}
+
+ :latency-proxy                         ; toxiproxy +Nms in front of MinIO (Tier-2 sim)
+ {:compare-+40ms
+  {:economical {:puts-per-commit 1.00 :write-p50 74.97 :write-mean 76.97}
+   :no-diff-buf {:write-p50 76.22 :write-mean 91.70}
+   :no-fusion   {:puts-per-commit 4.00 :write-p50 118.95 :write-mean 119.35}
+   :with-commit-graph {:puts-per-commit 2.00 :write-p50 68.16 :write-mean 71.10}}
+  :mixed-+25ms-tigris
+  {:opts {:tenants 15 :target-rate 100 :read-frac 0.9}
+   :read  {:p50 2.64 :p90 10.06 :p99 27.03}
+   :write {:p50 61.60 :p90 99.55 :p99 160.83}}}
+
+ ;; Tier 3 — direct-bucket reader (reader-demo + bin/reader-gets).
+ ;; The reader gets its OWN datahike connection registry: connections are cached on
+ ;; [store-id, branch], so a same-JVM "reader" would otherwise be handed the WRITER'S
+ ;; connection, deref its in-memory atom, and report ~0.05 ms with zero S3 traffic.
+ ;; GETs/deref (from the MinIO trace) is the ground truth.
+ :tier3-direct-reader
+ {:opts   {:issues 20 :reads 200}
+  :gets-per-deref 1.00                  ; MinIO trace, marginal (bin/reader-gets)
+  :reader {:p50 14.00 :p99 22.59}       ; direct bucket: one head GET per deref
+  :writer {:p50 0.03  :p99 0.14}}      ; local :self conn, for reference
+
+ ;; Density is NOT a constant — it scales with tenant DATA. The 0.09 MB figure is a
+ ;; 5-issue toy tenant; do not size a fleet with it.
+ :density
+ {:5-issues-per-tenant   {:tenants 1000 :heap-mb-per-tenant 0.09 :objects-per-tenant 8}
+  :100-issues-per-tenant {:tenants 50   :heap-mb-per-tenant 1.30 :objects-per-tenant 82}}
+
+ ;; Tier 4 — writer holds S3 directly; reader is tiered {lmdb, s3} with
+ ;; :write-policy :frontend-only (a cache; its LMDB starts empty). That policy is
+ ;; load-bearing: without it konserve defaults to :write-through and the writer's own
+ ;; commits fill the "reader's" LMDB, so the cold scan is served by a free cache.
+ :tier4-tiered-reader
+ {:opts {:notes 5000 :s3-latency-ms 40}
+  :reader-scan-1-lmdb-cold-ms 979    ; falls through to S3, filling the cache
+  :reader-scan-2-lmdb-warm-ms 586    ; the payoff: 4.2x vs S3-only
+  :s3-only-ms 2447}
+
+ ;; Tier 4 frontend GC — measured on a REAL streaming replica (kabel writer + kabel
+ ;; client on the tiered {lmdb, s3} store). The stream is not optional: a tiered reader
+ ;; that only derefs is FROZEN (the mutable head is served from its own LMDB cache), so
+ ;; it would cache one generation and report a meaningless reclaim. The demo asserts the
+ ;; replica's max-tx matches the writer's before believing any of this.
+ :tier4-frontend-gc
+ {:opts {:entities 2000 :updates 1000}
+  :frontend-on-connect 39            ; warmed by the konserve-sync handshake
+  :frontend-before-sweep 920         ; grown by the live commit push
+  :frontend-after-sweep 37           ; 96% reclaimed (883/920); only 41 keys reachable
+  :reachable 41
+  :backend-before 938
+  :backend-after 938                 ; untouched — the writer's job
+  :replica-current? true             ; max-tx == writer's, and it sees the final churn
+  :rows-after 2000}}

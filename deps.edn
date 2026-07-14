@@ -1,0 +1,94 @@
+{:paths ["src" "resources"]
+
+ :deps
+ {org.clojure/clojure   {:mvn/version "1.12.4"}
+
+  ;; The multi-tenant object-store write path. These are minimum versions — the
+  ;; features this template is built on landed across them:
+  ;;  - datahike 0.8.1731   diff-buf write-buffering, index-root fusion and the
+  ;;                        commit-graph opt-out (the per-store write-amplification
+  ;;                        knobs); concurrent background GC; per-tenant delete;
+  ;;                        Tier-4 streaming replicas.
+  ;;  - konserve 0.9.359    single-request reads (PReadMissSafe), ordered multi-assoc,
+  ;;                        tiered stores that never write through a read-only backend.
+  ;;  - konserve-s3 0.1.35  shared S3 clients + marker registry (multi-tenant
+  ;;                        de-contention), virtual-thread IO, one round-trip per PUT.
+  ;; persistent-sorted-set arrives transitively via datahike.
+  org.replikativ/datahike    {:mvn/version "0.8.1731"}
+  org.replikativ/konserve-s3 {:mvn/version "0.1.35"}
+  org.replikativ/konserve    {:mvn/version "0.9.359"}
+
+  ;; Config as data — one file, four tier profiles (see resources/config.edn).
+  aero/aero {:mvn/version "1.1.6"}
+
+  ;; HTTP service — kept small. reitit routing + muuntaja JSON, Jetty adapter.
+  metosin/reitit-ring       {:mvn/version "0.7.2"}
+  metosin/reitit-middleware {:mvn/version "0.7.2"}
+  metosin/muuntaja          {:mvn/version "0.6.10"}
+  ring/ring-jetty-adapter   {:mvn/version "1.13.0"}
+
+  ;; hato — HTTP client for datahike's :datahike-server writer (direct-S3 readers
+  ;; use a non-streaming writer so @conn re-reads the head from the shared store).
+  hato/hato {:mvn/version "0.9.0"}
+
+  org.replikativ/logging {:mvn/version "0.1.3"}}
+
+ :aliases
+ {;; ── Dev ──────────────────────────────────────────────────────────────────
+  :dev {:extra-paths ["dev" "test"]
+        :extra-deps  {org.clojure/tools.namespace {:mvn/version "1.5.0"}
+                      nrepl/nrepl                 {:mvn/version "1.3.0"}
+                      cider/cider-nrepl           {:mvn/version "0.50.2"}}
+        :main-opts   ["-m" "nrepl.cmdline"
+                      "--middleware" "[cider.nrepl/cider-middleware]"
+                      "--port" "7888"]}
+
+  ;; ── Benchmarks — open-loop workload + HdrHistogram percentiles ────────────
+  :bench {:extra-paths ["bench"]
+          :extra-deps  {org.hdrhistogram/HdrHistogram              {:mvn/version "2.2.2"}
+                        com.clojure-goes-fast/clj-async-profiler   {:mvn/version "1.6.1"}}
+          :jvm-opts    ["-XX:+UnlockDiagnosticVMOptions" "-XX:+DebugNonSafepoints"]}
+
+  ;; ── Tier 3/4 transport: streaming writer + read replicas ──────────────────
+  :kabel {:extra-deps {org.replikativ/kabel         {:mvn/version "0.3.100"}
+                       org.replikativ/konserve-sync {:mvn/version "0.1.36"}
+                       is.simm/distributed-scope    {:mvn/version "0.1.6"}
+                       http-kit/http-kit            {:mvn/version "2.8.1"}}}
+
+  ;; ── Tier 4 frontend: local LMDB tier over S3 ──────────────────────────────
+  ;; LMDB tier (Tier 4). konserve-lmdb arrives transitively via datahike-lmdb.
+  :lmdb {:extra-deps {org.replikativ/datahike-lmdb {:mvn/version "0.1.8"}}}
+
+  :run {:main-opts ["-m" "datahike-saas.core"]}
+
+  ;; Tests — in-memory (:memory backend), no MinIO needed.
+  ;;   clj -M:test         (main entry)   |   clj -X:test  (CI, via bin/run-unittests)
+  :test {:extra-paths ["test"]
+         :extra-deps  {io.github.cognitect-labs/test-runner
+                       {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+         :main-opts   ["-m" "cognitect.test-runner"]
+         :exec-fn     cognitect.test-runner.api/test}
+
+  ;; Integration tests against a real MinIO (localhost:9000). Kept separate from
+  ;; :test so unit runs need no object store.  clj -M:integration
+  :integration {:extra-paths ["test-integration"]
+                :extra-deps  {io.github.cognitect-labs/test-runner
+                              {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+                :main-opts   ["-m" "cognitect.test-runner" "-d" "test-integration"]
+                :exec-fn     cognitect.test-runner.api/test
+                :exec-args   {:dirs ["test-integration"]}}
+
+  ;; Tier-4 streaming guarantees against MinIO. A SEPARATE directory, not just a test
+  ;; selector: the ns requires the streaming stack, so the :integration runner above
+  ;; cannot even LOAD it without :kabel on the classpath. Needs SAAS_TIER=tier4 + LMDB_PATH:
+  ;;   SAAS_TIER=tier4 LMDB_PATH=... clj -X:kabel:lmdb:integration-tier4
+  :integration-tier4 {:extra-paths ["test-integration-tier4"]
+                      :extra-deps  {io.github.cognitect-labs/test-runner
+                                    {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+                      :exec-fn     cognitect.test-runner.api/test
+                      :exec-args   {:dirs ["test-integration-tier4"]}}
+
+  :format {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
+           :main-opts  ["-m" "cljfmt.main" "check" "src" "bench" "test" "test-integration" "test-integration-tier4" "dev"]}
+  :ffix   {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
+           :main-opts  ["-m" "cljfmt.main" "fix" "src" "bench" "test" "test-integration" "test-integration-tier4" "dev"]}}}

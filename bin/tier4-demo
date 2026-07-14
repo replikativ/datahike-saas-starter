@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Tier 4 demo: a per-reader LMDB cache tier over the shared S3 bounds the cold-read tail.
+#
+# Models the SHIPPED topology (see doc/ladder.md):
+#   - the WRITER holds S3 directly (no local tier)
+#   - the READER is tiered {lmdb, s3} with :write-policy :frontend-only — a cache that
+#     never writes the writer's S3 — so its LMDB starts EMPTY
+#
+# Four phases in SEPARATE JVMs (one LMDB env each, cold in-memory cache per scan),
+# against MinIO with the S3 backend behind a +LATms latency proxy:
+#   seed         -> writer populates the shared S3.       Reader LMDB: still empty.
+#   tiered-cold  -> reader's 1st scan: falls through to S3, filling the LMDB on the way
+#   tiered-warm  -> reader's 2nd scan, fresh process: LMDB warm.  <- the Tier-4 payoff
+#   s3           -> the same scan with no local tier: the tail the LMDB removes
+#
+# :write-policy :frontend-only is load-bearing: omit it and konserve defaults to
+# :write-through, so the writer's own commits fill the LMDB and the "cold" scan is served
+# by a cache it got for free — local disk vs network, not Tier 4.
+#
+# Requires: docker compose --profile tier1 up -d   (MinIO on :9000)
+# Usage: N=5000 LAT=40 bin/tier4-demo
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+N="${N:-5000}"; LAT="${LAT:-40}"
+SID="$(cat /proc/sys/kernel/random/uuid)"
+export SAAS_SID="$SID"
+export LMDB_PATH="$HOME/tmp/dh-tests/tier4-fe-${SID:0:8}"
+export N
+
+echo "Tier 4 demo — store $SID"
+echo "  reader LMDB: $LMDB_PATH   |   shared S3: MinIO at +${LAT}ms"
+./bin/latency-proxy "$LAT" >/dev/null
+
+run() { clojure -M:bench:lmdb -m datahike-saas.tier4-demo "$1" 2>/dev/null \
+        | grep -E "SEEDED|TIERCOLD|TIERWARM|S3ONLY"; }
+
+echo "seeding $N notes (writer -> shared S3) ..."; run seed
+cms="$(run tiered-cold | awk '{print $2}')"
+wms="$(run tiered-warm | awk '{print $2}')"
+sms="$(run s3          | awk '{print $2}')"
+
+echo
+printf "  %-44s %8s ms\n" "reader scan 1 (LMDB cold -> S3, fills cache)"  "$cms"
+printf "  %-44s %8s ms\n" "reader scan 2 (LMDB warm)"                     "$wms"
+printf "  %-44s %8s ms\n" "S3-only       (no local tier, +${LAT}ms RTT)"  "$sms"
+echo
+awk -v w="$wms" -v s="$sms" -v c="$cms" 'BEGIN {
+  printf "=> warm, the LMDB tier serves the cold scan %.1fx faster than S3.\n", s/w
+  printf "   First contact is %.1fx: it pays the S3 round trips AND fills the cache.\n", s/c
+  printf "   The cold-read tail ends up bounded by local disk, not the network.\n"
+}'
+
+rm -rf "$LMDB_PATH"

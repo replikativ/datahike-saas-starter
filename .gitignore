@@ -1,0 +1,24 @@
+/.cpcache/
+/.clj-kondo/.cache/
+/.lsp/.cache/
+/target/
+/classes/
+*.jar
+.nrepl-port
+.rebel_readline_history
+
+# local LMDB tier data (tier4)
+/data/
+saas-lmdb/
+
+# bench artifacts are curated under doc/results/; raw scratch is ignored
+/bench/scratch/
+*.hprof
+
+# JVM crash artifacts
+hs_err_pid*.log
+replay_pid*.log
+core.*
+
+# internal design notes / working docs — not part of the published template
+/.internal/

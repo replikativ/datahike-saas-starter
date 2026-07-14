@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# In-memory unit tests (no object store needed). Called by CircleCI (tools/unittest).
+echo "Running JVM tests"
+clojure -X:test

@@ -1,0 +1,14 @@
+;; A migration ("norm"). Every EDN file here is transacted into a tenant's database exactly
+;; once, in filename order, the first time that tenant is opened after the deploy — see
+;; `tenant/migrate!`. Datahike stamps each with :tx/norm so it never runs twice.
+;;
+;; This one is ADDITIVE: it adds an attribute. In a shared-schema SaaS that is an ALTER TABLE
+;; across every tenant's rows; here it is one small transaction per tenant (~31 ms), because
+;; datoms are sparse — there is no column to backfill.
+;;
+;; For a REWRITING migration (rename, retype, restructure), see doc/migrations.md: you cannot
+;; do it in place; you expand, backfill, cut over, contract.
+{:tx-data [{:db/ident       :issue/severity
+            :db/valueType   :db.type/long
+            :db/cardinality :db.cardinality/one
+            :db/doc         "1-5. Added by migration 001; older issues simply lack it."}]}

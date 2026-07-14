@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Measure ACTUAL PUTs/commit per store-config via MinIO's request trace.
+#
+# The in-process bench metric (net konserve key-set growth, `workload compare`)
+# cannot see this: every commit overwrites the branch head at a FIXED key — a real
+# PUT that adds no new key. This brackets a trace around N and 2N commits and takes
+# the marginal difference, so the one-time db-setup PUTs cancel and what's left is
+# the per-commit write amplification that maps to object-store $/PUT and latency.
+#
+#   docker compose --profile tier1 up -d     # MinIO on :9000
+#   bin/put-count                            # N defaults to 20
+#
+# Requires docker (uses the minio/mc trace API against the running MinIO).
+set -euo pipefail
+
+N="${N:-20}"
+# The trace file is BIND-MOUNTED into the mc container, so it must live somewhere the
+# docker daemon can share. A plain `mktemp -d` lands in /tmp, which on a default Linux
+# docker is private to the container — the file never appears on the host. Hence $HOME.
+OUT="$(mktemp -d -p "${TMPDIR:-$HOME/tmp}" put-count.XXXXXX)"; TRACE="$OUT/trace.json"
+
+docker rm -f saas-puttrace >/dev/null 2>&1 || true
+docker run -d --name saas-puttrace --network host -v "$OUT:/out" --entrypoint sh minio/mc:latest \
+  -c "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null 2>&1 && mc admin trace --json --call s3 local >/out/trace.json 2>/dev/null" >/dev/null
+sleep 3
+
+UUID_RE='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+declare -A SID
+VARIANTS="economical no-fusion no-diff-buf with-commit-graph"
+for V in $VARIANTS; do
+  for M in "$N" "$((2 * N))"; do
+    echo "  running $V x$M commits..." >&2
+    SID["$V-$M"]=$(MINIO_PORT=9000 SAAS_TIER=tier1 clojure -M:bench -m datahike-saas.put-count "$M" "$V" 2>/dev/null \
+                   | grep -oE "$UUID_RE" | head -1)
+  done
+done
+
+sleep 2; docker stop saas-puttrace >/dev/null 2>&1
+
+# Fail LOUD. A missing or PUT-less trace means the measurement did not happen; printing
+# 0.00 PUTs/commit would look like a spectacular result instead of a broken harness.
+if [[ ! -s "$TRACE" ]]; then
+  echo "ERROR: no MinIO trace at $TRACE — the mc container could not write to the host." >&2
+  echo "       (Is MinIO up on :9000? Can docker bind-mount \$HOME?)" >&2
+  rm -rf "$OUT"; exit 1
+fi
+if ! grep -q '"api":"s3.PutObject"' "$TRACE"; then
+  echo "ERROR: trace captured $(wc -l < "$TRACE") lines but ZERO PutObject calls." >&2
+  echo "       The benchmark wrote nothing, or the trace missed it. Not reporting 0." >&2
+  rm -rf "$OUT"; exit 1
+fi
+
+puts() { grep '"api":"s3.PutObject"' "$TRACE" | grep -c "$1" || true; }
+echo
+printf "  %-18s %12s\n" "config" "PUTs/commit"
+for V in $VARIANTS; do
+  a=$(puts "${SID[$V-$N]}"); b=$(puts "${SID[$V-$((2 * N))]}")
+  printf "  %-18s %12s\n" "$V" "$(echo "scale=2;($b-$a)/$N" | bc)"
+done
+rm -rf "$OUT"

@@ -1,0 +1,113 @@
+# Topology per tier, selected with a compose profile.
+#
+#   Tier 1 (dev):   docker compose --profile tier1 up -d      # MinIO + bucket
+#   Tier 3/4:       (add a kabel writer + reader replicas — see doc/ladder.md)
+#
+# Tier 1 is the only one that needs local infrastructure; tiers 2+ point at real
+# object storage via env (see resources/config.edn).
+
+services:
+  # Local S3, standing in for the object store you develop against.
+  minio:
+    image: minio/minio:latest
+    profiles: ["tier1", "tier3", "tier4"]
+    container_name: saas-minio
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # console (http://localhost:9001, minioadmin/minioadmin)
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: create the tenants bucket so tier1 is zero-config.
+  minio-init:
+    image: minio/mc:latest
+    profiles: ["tier1", "tier3", "tier4"]
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/tenants &&
+      echo 'bucket tenants ready'"
+
+  # ── Tier 3 (direct S3 readers): writer + stateless readers on the shared S3 ──
+  # `docker compose --profile tier3 up --build`
+  #   writer :8888 (writes)  |  reader :8889 (direct-S3 reads, auto-follow via deref)
+  # Write on the writer (POST :8888/t/<slug>/issues); read from the reader
+  # (GET :8889/t/<slug>/issues) — it derefs the shared S3, no writer connection.
+  writer:
+    profiles: ["tier3"]
+    build: .
+    command: ["clojure", "-M:run"]
+    environment:
+      SAAS_TIER: tier1
+      PORT: "8888"
+      MINIO_HOST: minio
+    ports: ["8888:8888"]
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  reader:
+    profiles: ["tier3"]
+    build: .
+    command: ["clojure", "-M:run"]
+    environment:
+      SAAS_TIER: tier1
+      SAAS_ROLE: reader
+      SAAS_WRITER_URL: http://writer:8888
+      PORT: "8889"
+      MINIO_HOST: minio
+    ports: ["8889:8889"]
+    depends_on:
+      - writer
+
+  # ── Tier 4 (streaming + lmdb+s3): kabel writer + tiered-store readers ────────
+  # `docker compose --profile tier4 up --build`
+  #   writer :8888 (+ kabel :8890)  |  reader :8889 (tiered lmdb+s3, stream-followed)
+  # The tier4 store is env-driven S3; here it points at the same MinIO.
+  writer-streaming:
+    profiles: ["tier4"]
+    build: .
+    command: ["clojure", "-M:run:kabel:lmdb"]
+    environment: &tier4-env
+      SAAS_TIER: tier4
+      S3_BUCKET: tenants
+      S3_ENDPOINT: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      SAAS_ROLE: writer-streaming
+      PORT: "8888"
+      SAAS_WRITER_WS: ws://0.0.0.0:8890
+    ports: ["8888:8888", "8890:8890"]
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  reader-streaming:
+    profiles: ["tier4"]
+    build: .
+    command: ["clojure", "-M:run:kabel:lmdb"]
+    environment:
+      <<: *tier4-env
+      SAAS_ROLE: reader-streaming
+      PORT: "8889"
+      SAAS_WRITER_WS: ws://writer-streaming:8890
+      LMDB_PATH: /data/lmdb
+    ports: ["8889:8889"]
+    depends_on:
+      - writer-streaming
+
+volumes:
+  minio-data:

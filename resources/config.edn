@@ -1,0 +1,142 @@
+;; datahike-saas-starter — one config, four tiers.
+;;
+;; The whole scaling story is a PROFILE SWAP. The domain code, the schema, the
+;; queries never change; only the `:store` (and, for the read-scaling tiers, an
+;; added `:streaming` block) differs. Read this file top-to-bottom and you have
+;; read the entire scaling argument.
+;;
+;; Select a tier with the SAAS_TIER env var (tier1..tier4); loaded by
+;; `datahike-saas.config`. Secrets and endpoints come from env with dev-friendly
+;; defaults, so `docker compose up -d minio` + tier1 needs zero configuration.
+
+{;; ── Shared Datahike settings — IDENTICAL across all four tiers ─────────────
+ ;; Object-store write-amplification knobs: collapse a small commit toward a
+ ;; single PUT. Each PUT is the dominant cost/latency on S3, so these knobs are what make
+ ;; per-tenant object storage economical. Measured in doc/benchmarks.md §1; the trade-offs
+ ;; are in doc/cost-model.md.
+ ;;   :fuse-index-roots?    inline each index's root into the db-record. An index root is
+ ;;                         rewritten on essentially every commit, so this saves one PUT per
+ ;;                         index TOUCHED — 2..6 per commit (eavt/aevt/avet, plus their temporal
+ ;;                         twins under :keep-history?) — and one GET per index on cold open.
+ ;;                         This is the PUT-floor lever: here 4 PUTs/commit -> 1.
+ ;;                         Cost: a fused record is bigger and shares less — two commits that
+ ;;                         didn't change an index can no longer point at the SAME root object.
+ ;;                         Only matters if you RETAIN records (:commit-graph? on); minor.
+ ;;   :commit-graph? false  drop the per-commit provenance object (−1 PUT/commit; time travel
+ ;;                         unaffected — it lives in the temporal indices). Gives up branching.
+ ;;   :diff-buf-size        buffer content-only child diffs into the ancestor. NOT a PUT-floor
+ ;;                         win — a shallow commit is 1.00 PUT either way. It cuts stored-object
+ ;;                         GROWTH (~25x on deeper workloads), so it buys storage and GC.
+ ;;                         Cost is CPU, not IO: buffered diffs are projected as nodes load, so a
+ ;;                         COLD FULL-RANGE SCAN does ~2x the node work. Point lookups, counts and
+ ;;                         warm scans are unaffected, and there are NO extra object-store reads.
+ ;;                         Create-time-fixed (irreversible). Newest of the three — promising, but
+ ;;                         wants more testing before calling it stable.
+ :keep-history?     false
+ :fuse-index-roots? true
+ :commit-graph?     false
+ :index-config      {:diff-buf-size 256}
+ :store-cache-size  #long #or [#env SAAS_STORE_CACHE "64"]
+ ;; NB the tenant POOL is bounded separately, in code, by SAAS_MAX_HOT (default 512): at most
+ ;; that many tenant connections stay open, LRU-evicted beyond it. A hot connection holds that
+ ;; tenant's in-memory index (~0.09 MB at 5 issues, ~1.30 MB at 100), so an unbounded pool grows
+ ;; with every tenant ever touched. Size it from your ACTIVE tenants; an evicted one pays ~+52 ms
+ ;; on its next request. SAAS_MAX_HOT=0 disables the bound. See src/datahike_saas/tenant.clj.
+ ;; The DEFAULT writer: this node has write authority and reads its own in-memory db.
+ ;; A Tier-3 READ REPLICA must NOT use this — `:self` is a *streaming* writer, so `@conn`
+ ;; returns the in-memory atom instead of re-reading the branch head, and the node would
+ ;; silently serve a frozen snapshot forever. Readers get `:writer {:backend :datahike-server}`
+ ;; (non-streaming => deref re-reads the head) — set for you by SAAS_ROLE=reader; see core.clj.
+ :writer            {:backend :self
+                     :transaction-queue-size 256
+                     :commit-queue-size      256}
+
+ ;; ── The tier-specific store — THIS is the only thing that changes ──────────
+ :store
+ #profile
+ {;; Local — the fastest way to see the model work. A plain directory on disk: one
+  ;; folder per tenant, no Docker, no cloud account, no credentials. This is the DEFAULT
+  ;; (SAAS_TIER unset), so `clj -M:dev` just runs.
+  ;;
+  ;; It is a real Datahike database per tenant — the domain code, schema and queries are
+  ;; identical to every tier below. What it does NOT exercise is the object-store write
+  ;; path, so PUT counts and RTT don't apply here: for that, use :tier1 (MinIO) or a real
+  ;; bucket (:tier2). Moving up is one env var.
+  :local
+  {:backend :file
+   :path    #or [#env SAAS_DATA_DIR "data/tenants"]}
+
+  ;; Tier 1 — local dev against the REAL object-store path. MinIO speaking S3.
+  ;; `docker compose --profile tier1 up -d`. This is what the benchmarks and CI use:
+  ;; it exercises konserve-s3, so PUTs/commit and round-trip latency are meaningful.
+  :tier1
+  {:backend            :s3
+   :region             "us-east-1"
+   :bucket             #or [#env S3_BUCKET "tenants"]
+   :path-style-access? true
+   :access-key         #or [#env AWS_ACCESS_KEY_ID "minioadmin"]
+   :secret             #or [#env AWS_SECRET_ACCESS_KEY "minioadmin"]
+   :endpoint-override  {:protocol :http
+                        :hostname #or [#env MINIO_HOST "localhost"]
+                        :port     #long #or [#env MINIO_PORT "9000"]}}
+
+  ;; Tier 2 — real object storage: AWS S3 / Tigris / Hetzner. Same :s3 backend;
+  ;; only creds + endpoint change. For plain AWS, leave S3_ENDPOINT unset and the
+  ;; endpoint-override is dropped (config.clj); for Tigris/Hetzner, set S3_ENDPOINT.
+  :tier2
+  {:backend            :s3
+   :region             #or [#env AWS_REGION "auto"]
+   :bucket             #env S3_BUCKET
+   :path-style-access? #boolean #or [#env S3_PATH_STYLE "true"]
+   :access-key         #or [#env AWS_ACCESS_KEY_ID nil]
+   :secret             #or [#env AWS_SECRET_ACCESS_KEY nil]
+   :s3-endpoint        #or [#env S3_ENDPOINT nil]}
+
+  ;; Tier 3 — read scale-out, DIRECT (no streaming). Stateless readers connect to the
+  ;; shared S3 and just deref: a non-streaming connection re-reads the branch head from
+  ;; the store each deref, so they auto-follow the writer with no writer connection.
+  ;; Same :s3 store as tier2; scaling reads is just running more reader nodes. Reads
+  ;; use S3 + datahike's in-memory node cache; no LMDB (the mutable head must not cache).
+  :tier3
+  {:backend            :s3
+   :region             #or [#env AWS_REGION "auto"]
+   :bucket             #env S3_BUCKET
+   :path-style-access? #boolean #or [#env S3_PATH_STYLE "true"]
+   :access-key         #or [#env AWS_ACCESS_KEY_ID nil]
+   :secret             #or [#env AWS_SECRET_ACCESS_KEY nil]
+   :s3-endpoint        #or [#env S3_ENDPOINT nil]}
+
+  ;; Tier 4 — STREAMING + lmdb+s3 (low staleness + bounded tail). A kabel writer streams
+  ;; each commit to readers whose store is this tiered {lmdb, shared-s3}: the stream
+  ;; delivers the head (fresh, no per-deref S3 read, no stale-head caching), and node
+  ;; reads hit the local LMDB (sub-ms) before the shared S3. Writer holds the S3 backend.
+  :tier4
+  {:backend         :tiered
+   ;; Cache mode: konserve-sync warms the LMDB frontend; reads fall through to S3 on a
+   ;; miss; the peer NEVER writes the shared, writer-owned S3 (needs konserve 0.9.355+).
+   :write-policy    :frontend-only
+   :read-policy     :frontend-first
+   :frontend-config {:backend :lmdb
+                     :path    #or [#env LMDB_PATH "data/lmdb"]}
+   :backend-config  {:backend            :s3
+                     :region             #or [#env AWS_REGION "auto"]
+                     :bucket             #env S3_BUCKET
+                     :path-style-access? #boolean #or [#env S3_PATH_STYLE "true"]
+                     :access-key         #or [#env AWS_ACCESS_KEY_ID nil]
+                     :secret             #or [#env AWS_SECRET_ACCESS_KEY nil]
+                     :s3-endpoint        #or [#env S3_ENDPOINT nil]}}}
+
+ ;; ── Streaming topology — Tier 4 only ──────────────────────────────────────
+ ;; A single kabel writer streams commits to readers, which keep their tiered
+ ;; {lmdb, shared-s3} view warm without polling S3. (Tier 3 needs none — direct
+ ;; readers just deref the shared bucket.)
+ ;;
+ ;; The node's role comes from SAAS_ROLE, read directly in `core.clj/conn-source`:
+ ;;   (unset)           single node — :self writer, full read+write authority
+ ;;   reader            Tier 3 — direct-bucket reader (non-streaming :datahike-server writer)
+ ;;   writer-streaming  Tier 4 — kabel writer (streams commits to readers)
+ ;;   reader-streaming  Tier 4 — kabel reader on the tiered {lmdb, s3} store
+ :streaming
+ #profile
+ {:default nil
+  :tier4 {:writer-ws #or [#env SAAS_WRITER_WS "ws://localhost:8890"]}}}

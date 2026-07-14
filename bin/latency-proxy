@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Put a latency proxy in front of the local MinIO so benchmarks see a realistic
+# object-store round trip instead of a localhost disk. Toxiproxy listens on
+# :19000 and forwards to MinIO on :9000, adding LAT_MS of downstream latency.
+# This approximates a same-region cloud PUT/GET leg (see doc/benchmarks.md §4) —
+# good for the median/round-trip story; it does NOT model S3's throttling tail.
+#
+#   bin/latency-proxy [LAT_MS] [JITTER_MS]     # default 40 0
+#   MINIO_PORT=19000 SAAS_TIER=tier1 clj -M:bench -m datahike-saas.workload compare
+#
+# Published same-region small-object PUT latencies (doc/benchmarks.md §4 has sources):
+#   S3 Express ~single-digit  |  Tigris <17  |  AWS S3 ~tens of ms  |  R2 >340 (avoid)
+#
+# Better still: skip the proxy and point the benchmarks at your real bucket with
+# SAAS_TIER=tier2 + credentials.
+#
+# Requires docker; assumes MinIO is already up on :9000.
+set -euo pipefail
+
+LAT_MS="${1:-40}"
+JITTER="${2:-0}"
+API="http://127.0.0.1:8474"
+
+if ! docker ps --format '{{.Names}}' | grep -q '^saas-toxiproxy$'; then
+  echo "starting toxiproxy…"
+  docker run --rm -d --name saas-toxiproxy --network host ghcr.io/shopify/toxiproxy >/dev/null
+  sleep 2
+fi
+
+# (re)create the proxy + latency toxic (idempotent)
+curl -s -X DELETE "$API/proxies/minio" >/dev/null 2>&1 || true
+curl -s -X POST "$API/proxies" \
+  -d '{"name":"minio","listen":"127.0.0.1:19000","upstream":"127.0.0.1:9000"}' >/dev/null
+curl -s -X POST "$API/proxies/minio/toxics" \
+  -d "{\"name\":\"lat\",\"type\":\"latency\",\"stream\":\"downstream\",\"attributes\":{\"latency\":${LAT_MS},\"jitter\":${JITTER}}}" >/dev/null
+
+echo "MinIO reachable at 127.0.0.1:19000 with +${LAT_MS}ms (jitter ${JITTER}ms) downstream latency"
+echo "run benches with:  MINIO_PORT=19000 SAAS_TIER=tier1 clj -M:bench -m datahike-saas.workload <bench>"

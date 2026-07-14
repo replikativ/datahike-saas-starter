@@ -1,0 +1,76 @@
+version: 2.1
+
+# Uses the replikativ clj-tools orb, like the konserve backends. This is an
+# application (not a published library), so there is no clojars deploy/release
+# stage. Two test layers:
+#   - tools/unittest : in-memory (:memory backend), no service needed
+#   - integration    : end-to-end against a MinIO service container (like konserve-s3)
+orbs:
+  tools: replikativ/clj-tools@0
+
+jobs:
+  # End-to-end against a MinIO service container. On the docker executor the
+  # secondary image is reachable on localhost:9000, matching the tier1 config; the
+  # test self-creates the 'tenants' bucket.
+  integration:
+    docker:
+      - image: clojure:temurin-21-tools-deps
+      - image: minio/minio:latest
+        environment:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        command: server /data
+    steps:
+      - checkout
+      - run:
+          name: wait for MinIO on :9000
+          command: |
+            for i in $(seq 1 60); do (echo > /dev/tcp/localhost/9000) 2>/dev/null && exit 0; sleep 1; done
+            echo "MinIO did not come up on :9000"; exit 1
+      - run:
+          name: integration tests against MinIO
+          command: SAAS_TIER=tier1 clojure -X:integration
+
+  # Tier-4 streaming guarantees (kabel writer + tiered {lmdb, shared-s3} reader).
+  # Separate job: needs the :kabel + :lmdb deps and SAAS_TIER=tier4, and it asserts
+  # on the reader's LOCAL LMDB — a regression there is silent (queries still pass,
+  # they just round-trip to S3), so it has to be measured, not inferred.
+  integration-tier4:
+    docker:
+      - image: clojure:temurin-21-tools-deps
+      - image: minio/minio:latest
+        environment:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        command: server /data
+    steps:
+      - checkout
+      - run:
+          name: wait for MinIO on :9000
+          command: |
+            for i in $(seq 1 60); do (echo > /dev/tcp/localhost/9000) 2>/dev/null && exit 0; sleep 1; done
+            echo "MinIO did not come up on :9000"; exit 1
+      - run:
+          name: tier-4 streaming tests against MinIO
+          command: |
+            SAAS_TIER=tier4 \
+            S3_BUCKET=tenants S3_ENDPOINT=http://localhost:9000 S3_PATH_STYLE=true \
+            AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+            LMDB_PATH=/tmp/saas-lmdb \
+            clojure -X:kabel:lmdb:integration-tier4
+
+workflows:
+  build-and-test:
+    jobs:
+      - tools/setup:
+          context: docker-deploy
+      - tools/format:
+          context: docker-deploy
+          requires:
+            - tools/setup
+      - tools/unittest:
+          context: docker-deploy
+          requires:
+            - tools/setup
+      - integration
+      - integration-tier4
