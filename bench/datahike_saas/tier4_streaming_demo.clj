@@ -13,8 +13,9 @@
      SAAS_TIER=tier4 S3_BUCKET=tenants S3_ENDPOINT=http://localhost:9000 \\
        AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1 \\
        clj -M:bench:kabel:lmdb -m datahike-saas.tier4-streaming-demo"
-  (:require [datahike-saas.streaming :as streaming]
-            [datahike-saas.domain :as dom]
+  (:require [datahike-saas.kernel.streaming :as streaming]
+            [datahike-saas.example.schema :as schema]
+            [datahike-saas.example.domain :as dom]
             [datahike-saas.harness :as h]
             [datahike.api :as d])
   (:import [java.util UUID]))
@@ -22,7 +23,7 @@
 (defn -main [& _]
   (let [url  (str "ws://localhost:8891")
         slug (str "t3-" (subs (str (UUID/randomUUID)) 0 8))
-        w    (streaming/start-writer! {:ws-url url})]
+        w    (streaming/start-writer! {:ws-url url :ensure-schema schema/ensure-schema!})]
     (try
       ;; writer: create + seed the tenant, register it for remote access
       (let [wc (streaming/writer-conn w slug)]

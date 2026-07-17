@@ -1,5 +1,8 @@
-(ns datahike-saas.config
+(ns datahike-saas.kernel.config
   "Load the tiered store config (resources/config.edn) for a given tier.
+
+   KERNEL namespace — reusable across any db-per-tenant SaaS on Datahike; it knows
+   nothing about the issue-tracker example.
 
    `resources/config.edn` is the single source of truth for the scaling story:
    one aero file whose `:store` profile is the only thing that differs between

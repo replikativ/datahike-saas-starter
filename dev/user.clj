@@ -1,6 +1,6 @@
 (ns user
   "REPL entry point. `(go)` opens a tenant pool on the active tier and seeds a
-   demo tenant; then poke at `datahike-saas.domain`.
+   demo tenant; then poke at `datahike-saas.example.domain`.
 
        docker compose --profile tier1 up -d      # once
        clj -M:dev                                # nREPL on :7888
@@ -8,17 +8,26 @@
 
    Tenant lifecycle — the db-per-tenant payoff:
 
-       (export \"acme\") (clone! \"acme\" \"acme-staging\") (delete! \"acme\")"
-  (:require [datahike-saas.config :as config]
-            [datahike-saas.tenant :as tenant]
-            [datahike-saas.domain :as dom]
-            [datahike-saas.lifecycle :as lc]
+       (export \"acme\") (clone! \"acme\" \"acme-staging\") (delete! \"acme\")
+
+   Blob attachments — :db.type/store-ref (see doc/blobs.md):
+
+       (def bid (attach! \"acme\" (:first-issue (seed! \"acme\")) \"README.md\"))
+       (String. (fetch \"acme\" bid))            ; the bytes back
+       (attachments-live \"acme\")               ; ids the GC will keep"
+  (:require [datahike-saas.kernel.config :as config]
+            [datahike-saas.kernel.tenant :as tenant]
+            [datahike-saas.kernel.lifecycle :as lc]
+            [datahike-saas.example.schema :as schema]
+            [datahike-saas.example.domain :as dom]
+            [datahike-saas.example.attachments :as att]
+            [clojure.java.io :as io]
             [datahike.api :as d]))
 
 (defonce pool (atom nil))
 
 (defn go []
-  (when-not @pool (reset! pool (tenant/create-pool)))
+  (when-not @pool (reset! pool (schema/create-pool)))   ;; kernel pool + issue-tracker schema
   (let [tier  (config/current-tier)
         store (get-in (:base-cfg @pool) [:store :backend])]
     (cond-> {:tier tier :store store}
@@ -72,3 +81,18 @@
 (defn delete!
   "Delete the tenant's DATABASE. Offboarding, and GDPR erasure, in one call."
   [slug] (lc/delete-tenant! @pool slug))
+
+;; blob attachments — :db.type/store-ref, bytes IN the tenant's store (see doc/blobs.md)
+(defn attach!
+  "Attach a file (path) or byte-array to an issue as an in-store blob; returns its content id."
+  [slug issue-id file-or-bytes]
+  (let [bytes (if (bytes? file-or-bytes)
+                file-or-bytes
+                (with-open [in (io/input-stream (io/file file-or-bytes))]
+                  (.readAllBytes in)))]
+    (att/attach! (conn slug) issue-id
+                 {:filename (if (bytes? file-or-bytes) "blob.bin" (str file-or-bytes))
+                  :content-type "application/octet-stream" :bytes bytes})))
+
+(defn fetch [slug blob-id] (att/fetch (conn slug) blob-id))
+(defn attachments-live [slug] (att/live-blob-ids @(conn slug)))

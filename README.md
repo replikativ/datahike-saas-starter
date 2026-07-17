@@ -9,7 +9,7 @@ a `tenant_id` column and hopes the `WHERE` clause is never wrong.
 This template makes a tenant nearly free. On [Datahike](https://github.com/replikativ/datahike)
 over object storage, a tenant is **a handful of objects in a bucket (~1 ¢/month)** and a
 megabyte or so of RAM while it's open — so one small VM holds thousands of them, each a genuinely
-isolated database you can query, export, clone, or **delete outright** (`datahike-saas.lifecycle`).
+isolated database you can query, export, clone, or **delete outright** (`datahike-saas.kernel.lifecycle`).
 Offboarding a customer is deleting their database, and GDPR erasure is complete by construction:
 their data lives in no other tenant's.
 
@@ -23,16 +23,24 @@ clj -M:dev            # nREPL on :7888. That's it.
 
 ```clojure
 (go)                       ; open a tenant pool
-(seed! "acme")             ; a couple of users, labels, issues
+(def i (:first-issue (seed! "acme")))   ; a couple of users, labels, issues
 (open-issues "acme")       ; => issues, newest first
+(def b (attach! "acme" i "README.md"))  ; a blob attachment — bytes in the tenant's store
+(String. (fetch "acme" b)) ; ... the bytes back (see doc/blobs.md)
 (seed! "globex")           ; a second tenant — a second DATABASE
-(delete! "acme")           ; ... and it's gone. Not the rows — the database.
+(delete! "acme")           ; ... and it's gone. Not the rows — the database (blobs included).
 ```
 
 No container to install, no cloud account, no credentials. Each tenant is a real Datahike
 database in a folder under `data/`. When you want a real bucket, it's **one environment
 variable** — the domain code, schema and queries never change. That is the whole argument, and
 you just ran it.
+
+> **Want to know how it works before you build on it?**
+> **[doc/architecture.md](doc/architecture.md)** is the map — the module graph (a reusable
+> *kernel* + a replaceable issue-tracker *example*), a request traced end-to-end, and the
+> tier ladder — and **[doc/building-your-own.md](doc/building-your-own.md)** is the four files
+> you write to put your own domain on the kernel.
 
 ### Or as an HTTP service
 
@@ -54,7 +62,7 @@ reference, so there's no separate setup step.
 ## The payoff: a tenant is a database, so offboarding is a delete
 
 That `(delete! "acme")` above is the whole argument. It is genuinely hard in a shared-schema SaaS
-and ordinary here (`datahike-saas.lifecycle`):
+and ordinary here (`datahike-saas.kernel.lifecycle`):
 
 ```clojure
 (export "acme")                      ; every datom — a self-contained takeout
@@ -158,7 +166,38 @@ None of them is free, and the third is a *feature trade* rather than a cost.
 dollars. Time travel (`as-of`/`history`) is a **separate** knob (`keep-history?`), unaffected by
 any of this.
 
+## Attachments — files, and the GC keeps them alive
+
+Issues carry blob attachments (screenshots, crash dumps) via Datahike's new
+`:db.type/store-ref` — a datom value that **names an object** the garbage collector then
+**marks**. The rule is *the database is the root set*: an object lives while a datom names it,
+so **`delete!` erases a tenant's attachments with the tenant** and GDPR erasure stays complete
+by construction. The same type covers two deployments, and the repo implements both
+(`example.attachments`):
+
+- **in-store** — bytes in the tenant's own konserve store (`attach!` / `fetch`); `d/gc-storage`
+  reclaims them, portably, on every backend. For moderate sizes.
+- **presigned S3-direct** — the browser `PUT`s straight to a bucket prefix (bytes never touch
+  your JVM); datahike hands you the live set (`reachable-store-refs`) and you sweep your prefix.
+  The only shape that scales to large files.
+
+```bash
+B64=$(base64 -w0 screenshot.png)
+curl -XPOST localhost:8899/t/acme/issues/$ISSUE_ID/attachments -H content-type:application/json \
+  -d "{\"filename\":\"shot.png\",\"content-type\":\"image/png\",\"data\":\"$B64\"}"   # => {"blob-id":…}
+```
+
+Content-addressed (a `hasch` hash), so re-upload is idempotent, identical bytes share one
+object, and an `as-of` read of an old reference yields the old bytes. **[doc/blobs.md](doc/blobs.md)**
+has the full story — the write window, why the id is content and not a path, and what it is
+*not* for.
+
 ## Beyond this template
+
+**Build your own domain on the kernel:** keep `kernel/`, replace `example/`. The kernel gives
+you the pool, tier config, lifecycle and HTTP server; you write four small files (schema,
+domain, routes, a composition root). **[doc/building-your-own.md](doc/building-your-own.md)**
+walks it end to end.
 
 **Your app speaks SQL?** [**pg-datahike**](https://github.com/replikativ/pg-datahike) embeds a
 PostgreSQL-compatible adapter — wire protocol, SQL translator, `pg_*` catalogs — inside a
@@ -175,18 +214,29 @@ writing a new backend is a small protocol implementation — the tiered-store tr
 
 ## Layout
 
+The code splits in two — a reusable **kernel** and a replaceable **example**. Arrows only
+point example → kernel; nothing in `kernel/` names anything in `example/`. **New here?
+[doc/architecture.md](doc/architecture.md) is the map** (module graph, a request end-to-end,
+the tier ladder). To build your own SaaS, [doc/building-your-own.md](doc/building-your-own.md)
+is "delete `example/`, write four files."
+
 ```
 resources/config.edn        every tier side by side — the scaling story as data
 data/                       the :local tier — one folder per tenant (gitignored)
 src/datahike_saas/
-  config.clj                load the base-cfg for a tier
-  schema.clj                issue-tracker schema (per tenant)
-  domain.clj                tx fns + queries — TIER-AGNOSTIC (never changes across tiers)
-  tenant.clj                lazy db-per-tenant connection registry
-  lifecycle.clj             export / delete / clone a tenant — the db-per-tenant payoff
-  handlers.clj              tenant-scoped JSON API (conn-fn seam; tier-agnostic)
-  core.clj                  Jetty + reitit entry point (clj -M:run); role-aware
-  streaming.clj             Tier 4 — kabel writer + tiered-store (lmdb+s3) read replicas
+  kernel/                   REUSABLE substrate — you don't edit this to ship
+    config.clj              load the base-cfg for a tier
+    tenant.clj              bounded, lazy db-per-tenant connection pool (schema INJECTED)
+    lifecycle.clj           export / delete / clone a tenant — the db-per-tenant payoff
+    routes.clj              health + tenant-lifecycle routes (domain-agnostic)
+    server.clj              Jetty + reitit + roles (writer/reader/streaming); DI seam
+    streaming.clj           Tier 4 — kabel writer + tiered-store (lmdb+s3) read replicas
+  example/                  the ISSUE TRACKER — replace this with your domain
+    schema.clj              issue schema + `create-pool` (kernel pool + schema injected)
+    domain.clj              tx fns + queries — TIER-AGNOSTIC (never changes across tiers)
+    attachments.clj         blob attachments — :db.type/store-ref (see doc/blobs.md)
+    routes.clj              tenant-scoped issue routes (the conn-fn seam)
+    app.clj                 composition root + -main (clj -M:run) — wires domain onto kernel
 dev/user.clj                REPL entry: (go) (seed! "acme") ...
 bench/                      open-loop load tests + HdrHistogram percentiles  (see doc/benchmarks.md)
 bin/                        put-count + reader-gets (real PUTs/GETs via MinIO trace),
@@ -195,6 +245,9 @@ test/                       in-memory domain + config tests            (clj -M:t
 test-integration/           end-to-end against MinIO                   (clj -X:integration)
 test-integration-tier4/     Tier-4 streaming guarantees against MinIO
                             (SAAS_TIER=tier4 LMDB_PATH=... clj -X:kabel:lmdb:integration-tier4)
+doc/architecture.md         START HERE — the map: module graph, a request, the tier ladder
+doc/building-your-own.md    keep the kernel, replace the example — the four files you write
+doc/blobs.md                attachments via :db.type/store-ref — in-store + presigned S3
 doc/ladder.md               the four-tier design, in depth
 doc/benchmarks.md           reproducible load tests + Tier-1 results
 doc/cost-model.md           $/tenant across providers; multi-tenant fleet back-of-envelope

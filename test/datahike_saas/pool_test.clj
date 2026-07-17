@@ -3,12 +3,14 @@
    is reading. The second is the whole difficulty — a time-based reaper would sometimes
    evict a slow query's connection underneath it."
   (:require [clojure.test :refer [deftest is testing]]
-            [datahike-saas.tenant :as tenant]
-            [datahike-saas.domain :as dom])
+            [datahike-saas.kernel.tenant :as tenant]
+            [datahike-saas.example.schema :as schema]
+            [datahike-saas.example.domain :as dom])
   (:import [java.util.concurrent CountDownLatch TimeUnit]))
 
 (defn- mem-pool [max-hot]
-  (tenant/create-pool {:max-hot max-hot
+  ;; schema/create-pool = kernel pool + the issue-tracker schema injected as :ensure-schema.
+  (schema/create-pool {:max-hot max-hot
                        :base-cfg {:store {:backend :memory}
                                   :keep-history? false
                                   :schema-flexibility :write

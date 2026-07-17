@@ -1,10 +1,11 @@
-(ns datahike-saas.domain
+(ns datahike-saas.example.domain
   "Issue-tracker domain operations — transactions and queries.
 
-   Everything here is TIER-AGNOSTIC: it takes a Datahike connection and does not
-   know or care whether the store underneath is MinIO, S3, a kabel-streamed
-   replica, or an LMDB-over-S3 tier. That invariance is the whole point of the
-   starter — moving up the scaling ladder never touches this file."
+   The DOMAIN layer of the example: this is what you replace with your own. Everything here
+   is TIER-AGNOSTIC — it takes a Datahike connection and does not know or care whether the
+   store underneath is MinIO, S3, a kabel-streamed replica, or an LMDB-over-S3 tier. That
+   invariance is the whole point of the starter — moving up the scaling ladder never touches
+   this file."
   (:require [datahike.api :as d]
             [clojure.string :as str])
   (:import [java.util Date UUID]))
@@ -142,7 +143,7 @@
        db issue-pull (str/lower-case text)))
 
 (defn issue
-  "Full detail for one issue id, including comments."
+  "Full detail for one issue id, including comments and attachments."
   [db id]
   (d/pull db
           [:issue/number :issue/title :issue/body
@@ -150,6 +151,8 @@
            {:issue/reporter [:user/handle]} {:issue/assignee [:user/handle]}
            {:issue/labels [:label/name :label/color]}
            :issue/created-at :issue/updated-at
+           {:issue/attachments [:attachment/blob :attachment/filename
+                                :attachment/content-type :attachment/size :attachment/storage]}
            {:issue/comments [:comment/body {:comment/author [:user/handle]} :comment/created-at]}]
           [:issue/id id]))
 

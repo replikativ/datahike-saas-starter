@@ -32,7 +32,7 @@
        AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1 \\
        LMDB_PATH=$HOME/tmp/dh-tests/t4gc \\
        clj -M:bench:kabel:lmdb -m datahike-saas.tier4-gc-demo"
-  (:require [datahike-saas.streaming :as streaming]
+  (:require [datahike-saas.kernel.streaming :as streaming]
             [datahike.api :as d]
             [datahike.gc]                         ;; reachable-in-branch (private — see note)
             [konserve.gc :refer [sweep!]]

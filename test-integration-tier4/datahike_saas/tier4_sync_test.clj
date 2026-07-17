@@ -30,7 +30,7 @@
    SAAS_TIER=tier4 is REQUIRED: without it `config/base-cfg` returns tier1's plain :s3
    store and every test errors with 'no tiered store found'."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
-            [datahike-saas.streaming :as st]
+            [datahike-saas.kernel.streaming :as st]
             [datahike.api :as d]
             [konserve.core :as k]
             [clojure.core.async :refer [<!!]]

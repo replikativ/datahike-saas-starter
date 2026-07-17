@@ -23,9 +23,10 @@
    Run: docker compose --profile tier1 up -d
         MINIO_PORT=9000 clj -M:bench -m datahike-saas.reader-demo
         MINIO_PORT=19000 ...   (behind bin/latency-proxy, to see it at cloud RTT)"
-  (:require [datahike-saas.tenant :as tenant]
-            [datahike-saas.domain :as dom]
-            [datahike-saas.config :as config]
+  (:require [datahike-saas.kernel.tenant :as tenant]
+            [datahike-saas.kernel.config :as config]
+            [datahike-saas.example.schema :as schema]
+            [datahike-saas.example.domain :as dom]
             [datahike-saas.harness :as h]
             [datahike.connections :as conns]
             [datahike.http.writer]))            ;; registers the :datahike-server writer
@@ -49,7 +50,7 @@
 
 (defn -main [& _]
   (let [slug  (str "rd-" (subs (str (random-uuid)) 0 8))
-        wpool (tenant/create-pool)                        ;; WRITER node: :self writer, shared S3
+        wpool (schema/create-pool)                        ;; WRITER node: :self writer, shared S3
         wc    (tenant/borrow wpool slug)]
     (dom/ensure-user! wc "alice" "Alice")
     (dom/create-issue! wc {:title "written by the writer" :reporter "alice"})
@@ -57,7 +58,7 @@
 
     ;; READER node: its own connection registry => a real, separate connection.
     (binding [conns/*connections* (atom {})]
-      (let [rpool (tenant/create-pool {:base-cfg (reader-base-cfg)})
+      (let [rpool (schema/create-pool {:base-cfg (reader-base-cfg)})
             rc    (tenant/borrow rpool slug)]
 
         ;; ── 1. it auto-follows the writer, with no coordination ───────────────

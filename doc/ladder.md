@@ -1,7 +1,7 @@
 # The scaling ladder
 
 Four rungs, each introduced when the previous one's limit is hit. The guiding property:
-the **application never changes** — `datahike-saas.domain` takes a connection and runs
+the **application never changes** — `datahike-saas.example.domain` takes a connection and runs
 transactions and queries, oblivious to what's underneath. What changes is the *store* and,
 for the read-scaling rungs, the *topology*.
 

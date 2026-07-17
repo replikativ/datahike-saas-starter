@@ -9,9 +9,10 @@
    key-set delta undercounts PUTs. PUTs/commit is the write metric that maps to
    object-store cost ($/PUT) and latency; net key-set growth (workload.clj
    `compare`) is the separate storage/GC metric."
-  (:require [datahike-saas.tenant :as tenant]
-            [datahike-saas.domain :as dom]
-            [datahike-saas.config :as config])
+  (:require [datahike-saas.kernel.tenant :as tenant]
+            [datahike-saas.kernel.config :as config]
+            [datahike-saas.example.schema :as schema]
+            [datahike-saas.example.domain :as dom])
   (:import [java.util UUID]))
 
 (def variants
@@ -26,7 +27,7 @@
         cfg     (merge (config/base-cfg) (variants variant))
         slug    (str "putc-" (name variant) "-" (subs (str (UUID/randomUUID)) 0 8))
         sid     (tenant/tenant-id->uuid slug)
-        pool    (tenant/create-pool {:base-cfg cfg})
+        pool    (schema/create-pool {:base-cfg cfg})
         conn    (tenant/borrow pool slug)]
     (dom/ensure-user! conn "u0" "U0")
     (dotimes [i n] (dom/create-issue! conn {:title (str "I" i) :reporter "u0"}))

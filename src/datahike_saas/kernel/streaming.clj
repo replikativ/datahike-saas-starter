@@ -1,7 +1,12 @@
-(ns datahike-saas.streaming
+(ns datahike-saas.kernel.streaming
   "Tier 4 — one authoritative writer STREAMS commits to read replicas that keep a
    local LMDB cache. (Tier 3 is the simpler, streaming-free tier: direct-S3 readers
    that just deref — see `datahike-saas.reader-demo`.)
+
+   KERNEL namespace — domain-agnostic. `start-writer!` takes an `:ensure-schema` fn it
+   passes to its tenant pool, so the writer installs whatever schema you inject and this
+   file knows nothing about the issue-tracker example. (Readers install no schema — they
+   follow the writer, which already has it.)
 
    The writer holds each tenant's S3-backed Datahike connection and runs a kabel
    WebSocket server. A reader runs a kabel client peer and, per tenant, connects
@@ -17,8 +22,8 @@
             [datahike.kabel.connector]                  ;; registers -connect* :kabel
             [datahike.kabel.handlers :as handlers]
             [datahike.kabel.fressian-handlers :as fh]
-            [datahike-saas.tenant :as tenant]
-            [datahike-saas.config :as config]
+            [datahike-saas.kernel.tenant :as tenant]
+            [datahike-saas.kernel.config :as config]
             [kabel.peer :as peer]
             [kabel.http-kit :refer [create-http-kit-handler!]]
             [kabel.middleware.fressian :refer [fressian]]
@@ -53,9 +58,15 @@
 
 (defn start-writer!
   "Start the authoritative writer: a kabel server peer plus an S3-backed tenant
-   pool. Returns a writer context. `ws-url` e.g. \"ws://0.0.0.0:8890\"."
-  [{:keys [ws-url] :or {ws-url "ws://localhost:8890"}}]
-  (let [pool    (tenant/create-pool {:base-cfg (writer-base-cfg)}) ;; the S3 backend
+   pool. Returns a writer context. `ws-url` e.g. \"ws://0.0.0.0:8890\".
+
+   `:ensure-schema` (fn conn -> conn, default identity) and `:migrations` are injected into
+   the writer's tenant pool — pass your domain's schema installer here."
+  [{:keys [ws-url ensure-schema migrations]
+    :or {ws-url "ws://localhost:8890" ensure-schema identity migrations "migrations"}}]
+  (let [pool    (tenant/create-pool {:base-cfg (writer-base-cfg)   ;; the S3 backend
+                                     :ensure-schema ensure-schema
+                                     :migrations migrations})
         handler (create-http-kit-handler! S ws-url writer-peer-id)
         srv     (peer/server-peer S handler writer-peer-id
                                   (comp (sync/server-middleware) ds/remote-middleware)

@@ -1,5 +1,10 @@
-(ns datahike-saas.tenant
-  "Lazy per-tenant connection registry.
+(ns datahike-saas.kernel.tenant
+  "Lazy per-tenant connection registry — the reusable heart of a db-per-tenant SaaS.
+
+   KERNEL namespace. It depends on NOTHING in your domain: the schema to install and
+   the migrations to apply are INJECTED into `create-pool` (`:ensure-schema`,
+   `:migrations`). That is the seam you build on — see `datahike-saas.example.app`
+   for how the issue-tracker example wires its schema in.
 
    Each tenant is its own Datahike database (db-per-tenant): isolation is total, a tenant's
    working set is its own, and a single-writer model applies per tenant rather than globally.
@@ -22,18 +27,17 @@
    Eviction is safe, and that is the whole difficulty. A connection must NEVER be closed while
    a request is reading it — that would release the store out from under an in-flight query.
    So each entry carries an in-flight count: `pin!`/`unpin!` bracket a request (see
-   `core/wrap-tenant-pin`), and eviction skips any tenant with in-flight work. A pinned tenant
-   is never evicted, no matter how old; if EVERY tenant is pinned we exceed :max-hot rather
-   than break a live request. Time-based eviction with a grace window would be simpler and
-   would occasionally close a slow query's connection underneath it — this doesn't.
+   `kernel.server/wrap-tenant-pin`), and eviction skips any tenant with in-flight work. A
+   pinned tenant is never evicted, no matter how old; if EVERY tenant is pinned we exceed
+   :max-hot rather than break a live request. Time-based eviction with a grace window would be
+   simpler and would occasionally close a slow query's connection underneath it — this doesn't.
 
    Cost of an eviction: the next request reopens the tenant and lazily faults its index nodes
    back in from the store. That is a warm reconnect, not the cold first-connect (which pays
    `create-database` + schema install). See doc/benchmarks.md §3b."
   (:require [datahike.api :as d]
             [datahike.norm.norm :as norm]
-            [datahike-saas.config :as config]
-            [datahike-saas.schema :as schema]
+            [datahike-saas.kernel.config :as config]
             [clojure.java.io :as io]
             [konserve-s3.core]                    ;; registers :s3 backend
             [replikativ.logging :as log])
@@ -91,9 +95,10 @@
 (defn- migrate!
   "Apply any pending migrations to this tenant, LAZILY — on the first touch after a deploy.
 
-   `datahike.norm` transacts every EDN norm under `resources/migrations/` that this database
-   has not seen, in filename order, and stamps each with `:tx/norm` so it is never applied
-   twice. Idempotent, per-database, and resumable by construction.
+   `datahike.norm` transacts every EDN norm under the pool's `:migrations` resource dir (default
+   `resources/migrations/`) that this database has not seen, in filename order, and stamps each
+   with `:tx/norm` so it is never applied twice. Idempotent, per-database, and resumable by
+   construction. `:migrations nil` on the pool disables this entirely.
 
    This is the answer to the objection that kills db-per-tenant elsewhere: 'do I now run
    10,000 migrations?' You don't run them at all — each tenant migrates itself when it is
@@ -104,8 +109,8 @@
 
    Measured: an additive norm is ~31 ms/tenant (one commit, 1 PUT) — adding an attribute is a
    small transaction, not an ALTER TABLE, because datoms are sparse. See doc/migrations.md."
-  [conn tenant-slug]
-  (when-let [migrations (io/resource "migrations")]
+  [conn migrations-resource tenant-slug]
+  (when-let [migrations (some-> migrations-resource io/resource)]
     (let [t0 (System/nanoTime)]
       (norm/ensure-norms! conn migrations)
       (log/debug :tenant/migrated {:tenant tenant-slug
@@ -113,6 +118,7 @@
 
 (defn- open-tenant!
   "Create (if missing), connect, ensure schema, and apply pending migrations for a tenant db.
+   The schema install and migrations are the pool's INJECTED `:ensure-schema` / `:migrations`.
    Returns {:conn :cfg :open-cost-ns}."
   [pool tenant-slug]
   (let [cfg (tenant-cfg pool tenant-slug)
@@ -120,8 +126,8 @@
     (when-not (d/database-exists? cfg)
       (d/create-database cfg))
     (let [conn (d/connect cfg)]
-      (schema/ensure-schema! conn)
-      (migrate! conn tenant-slug)                  ;; lazy, idempotent, per-tenant
+      ((:ensure-schema pool) conn)                  ;; injected — kernel installs nothing itself
+      (migrate! conn (:migrations pool) tenant-slug) ;; lazy, idempotent, per-tenant
       {:conn conn :cfg cfg :open-cost-ns (- (System/nanoTime) t0)})))
 
 ;; ── registry ────────────────────────────────────────────────────────────────
@@ -132,38 +138,47 @@
       (when (pos? n) n))))                            ;; SAAS_MAX_HOT=0 => unbounded
 
 (defn create-pool
-  "A tenant pool. `:base-cfg` defaults to the active tier's config. For a :tiered store
-   (Tier 4) the :lmdb backend is loaded on demand (needs the :lmdb alias).
+  "A tenant pool. For a :tiered store (Tier 4) the :lmdb backend is loaded on demand
+   (needs the :lmdb alias).
 
-   `:max-hot` bounds how many connections stay open (default: env SAAS_MAX_HOT, else 512).
-   `nil` (or SAAS_MAX_HOT=0) means unbounded — the old behaviour, and what the density
-   benchmark wants."
+   Options — the seam you wire your domain into:
+   - `:base-cfg`      the active tier's config by default.
+   - `:ensure-schema` a fn `conn -> conn` run once when a tenant db is opened; install your
+                      schema here. Default `identity` (a bare kernel installs nothing). The
+                      issue-tracker example passes `example.schema/ensure-schema!`.
+   - `:migrations`    resource dir of EDN norms applied lazily per tenant (default
+                      `\"migrations\"`); `nil` disables migrations.
+   - `:max-hot`       how many connections stay open (default: env SAAS_MAX_HOT, else 512).
+                      `nil` (or SAAS_MAX_HOT=0) means unbounded — what the density benchmark wants."
   ([] (create-pool {}))
-  ([{:keys [base-cfg max-hot] :or {max-hot :default}}]
+  ([{:keys [base-cfg max-hot ensure-schema migrations]
+     :or {max-hot :default ensure-schema identity migrations "migrations"}}]
    (let [cfg (or base-cfg (config/base-cfg))]
      (when (= :tiered (get-in cfg [:store :backend]))
        (require 'datahike-lmdb.core))                 ;; registers the :lmdb backend
-     {:base-cfg cfg
-      :tenants  (ConcurrentHashMap.)
+     {:base-cfg      cfg
+      :ensure-schema ensure-schema
+      :migrations    migrations
+      :tenants       (ConcurrentHashMap.)
       ;; Pins are keyed by SLUG, not by entry: a tenant is pinned for the life of the request,
       ;; which BEGINS BEFORE its connection exists (the first request for a tenant opens it).
       ;; Pinning the entry instead would leave that first connection unprotected between
       ;; `borrow` creating it and the handler reading it.
-      :pins     (ConcurrentHashMap.)
-      :max-hot  (if (= max-hot :default) (or (env-max-hot) 512) max-hot)
-      :clock    (AtomicLong. 0)})))                   ;; monotonic tick — LRU ordering, no wall clock
+      :pins          (ConcurrentHashMap.)
+      :max-hot       (if (= max-hot :default) (or (env-max-hot) 512) max-hot)
+      :clock         (AtomicLong. 0)})))              ;; monotonic tick — LRU ordering, no wall clock
 
 (defn- touch! [pool entry]
   (.set ^AtomicLong (:used entry) (.incrementAndGet ^AtomicLong (:clock pool))))
 
 (defn pin!
   "Mark a tenant as IN USE. A pinned tenant is never evicted, however old. Must be paired
-   with `unpin!` in a finally — `core/wrap-tenant-pin` does this for every HTTP request."
+   with `unpin!` in a finally — `kernel.server/wrap-tenant-pin` does this for every HTTP request."
   [pool tenant-slug]
   (let [^ConcurrentHashMap pins (:pins pool)]
     (.incrementAndGet ^AtomicLong
-                      (.computeIfAbsent pins tenant-slug
-                                        (reify Function (apply [_ _] (AtomicLong. 0)))))))
+     (.computeIfAbsent pins tenant-slug
+                       (reify Function (apply [_ _] (AtomicLong. 0)))))))
 
 (defn unpin! [pool tenant-slug]
   (let [^ConcurrentHashMap pins (:pins pool)]

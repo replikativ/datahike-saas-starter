@@ -1,6 +1,6 @@
 (ns datahike-saas.http-load
   "End-to-end HTTP load test: fires requests at a running service (see
-   datahike-saas.core) so the measured latency includes the web layer — Jetty,
+   datahike-saas.example.app) so the measured latency includes the web layer — Jetty,
    muuntaja/JSON, routing — on top of the domain work. Compare against the
    domain-level `workload mixed` numbers to see the HTTP overhead.
 

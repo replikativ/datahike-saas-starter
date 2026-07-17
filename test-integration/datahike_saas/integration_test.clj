@@ -6,9 +6,10 @@
    Kept out of the default `test/` path so `clj -M:test` (in-memory) needs no
    object store."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
-            [datahike-saas.tenant :as tenant]
-            [datahike-saas.domain :as dom]
-            [datahike-saas.lifecycle :as lc]
+            [datahike-saas.kernel.tenant :as tenant]
+            [datahike-saas.kernel.lifecycle :as lc]
+            [datahike-saas.example.schema :as schema]
+            [datahike-saas.example.domain :as dom]
             [datahike.api :as d]
             [konserve-s3.core :as s3]))
 
@@ -29,7 +30,7 @@
 
 (deftest tier1-minio-roundtrip
   (testing "a tenant's issues round-trip through MinIO-backed Datahike"
-    (let [pool (tenant/create-pool)                     ; tier1 = :s3 @ localhost:9000
+    (let [pool (schema/create-pool)                     ; tier1 = :s3 @ localhost:9000
           slug (str "ci-" (random-uuid))
           c    (tenant/borrow pool slug)]
       (try
@@ -44,7 +45,7 @@
           (is (= {:issue.state/open 1} (:by-state (dom/stats @c))))
           (testing "reconnect sees the durable state"
             (tenant/close-all! pool)
-            (let [pool2 (tenant/create-pool)
+            (let [pool2 (schema/create-pool)
                   c2    (tenant/borrow pool2 slug)]
               (is (= [1] (map :issue/number (dom/open-issues @c2))))
               (tenant/close-all! pool2))))
@@ -63,7 +64,7 @@
 ;; test that only checks titles and stats passes. Hence: assert the REFS.
 
 (deftest tenant-export-clone-delete
-  (let [pool (tenant/create-pool)
+  (let [pool (schema/create-pool)
         src  (str "lc-src-" (random-uuid))
         dst  (str "lc-dst-" (random-uuid))]
     (try
@@ -130,7 +131,7 @@
 ;; database knows which norms it has.
 
 (deftest tenant-migrates-lazily-on-first-touch
-  (let [pool (tenant/create-pool)
+  (let [pool (schema/create-pool)
         slug (str "mig-" (random-uuid))]
     (try
       (testing "a tenant opened after the deploy has the migration applied"

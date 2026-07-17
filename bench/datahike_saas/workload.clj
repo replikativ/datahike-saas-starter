@@ -8,9 +8,10 @@
      gc        — storage reclaimed by d/gc-storage after churn
    For PUTs/commit (the cost/latency write metric) see bin/put-count."
   (:require [datahike.api :as d]
-            [datahike-saas.config :as config]
-            [datahike-saas.tenant :as tenant]
-            [datahike-saas.domain :as dom]
+            [datahike-saas.kernel.config :as config]
+            [datahike-saas.kernel.tenant :as tenant]
+            [datahike-saas.example.schema :as schema]
+            [datahike-saas.example.domain :as dom]
             [datahike-saas.harness :as h]
             [konserve.core :as k]
             [clojure.edn :as edn]
@@ -93,7 +94,7 @@
    PUTs/commit (the cost/latency metric) see `bin/put-count`."
   [cfg n]
   (let [slug (str "wa-" (short-id))
-        pool (tenant/create-pool {:base-cfg cfg})
+        pool (schema/create-pool {:base-cfg cfg})
         conn (tenant/borrow pool slug)
         _    (seed-actors! conn)
         base (object-count conn)
@@ -141,7 +142,7 @@
    are fully parallel)."
   [{:keys [tenants target-rate duration-s workers read-frac seed-issues skew]
     :or   {tenants 20 target-rate 200 duration-s 20 workers 48 read-frac 0.9 seed-issues 30 skew 0}}]
-  (let [pool  (tenant/create-pool)
+  (let [pool  (schema/create-pool)
         slugs (mapv #(str "ml-" %) (range tenants))
         pick  (zipf-sampler tenants skew)]
     (println "  seeding" tenants "tenants x" seed-issues "issues (all connections hot) ...")
@@ -168,7 +169,7 @@
    garbage to collect in the first place (which is itself the point)."
   [{:keys [issues churn variant] :or {issues 50 churn 800 variant :no-diff-buf}}]
   (let [cfg  (variant-cfg (config/base-cfg) variant)
-        pool (tenant/create-pool {:base-cfg cfg})
+        pool (schema/create-pool {:base-cfg cfg})
         conn (tenant/borrow pool (str "gc-" (short-id)))
         ids  (atom [])]
     (seed-actors! conn)
@@ -197,7 +198,7 @@
    every connection has to stay open. A bounded pool (the default in production —
    `SAAS_MAX_HOT`) would cap the count and this would measure the cap instead."
   [{:keys [tenants issues-per] :or {tenants 1000 issues-per 5}}]
-  (let [pool (tenant/create-pool {:max-hot nil})
+  (let [pool (schema/create-pool {:max-hot nil})
         rt   (Runtime/getRuntime)
         _    (dotimes [_ 3] (System/gc))
         heap0 (- (.totalMemory rt) (.freeMemory rt))

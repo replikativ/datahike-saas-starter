@@ -2,8 +2,8 @@
   "Domain logic over an in-memory datahike db — no object store needed."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datahike.api :as d]
-            [datahike-saas.schema :as schema]
-            [datahike-saas.domain :as dom]))
+            [datahike-saas.example.schema :as schema]
+            [datahike-saas.example.domain :as dom]))
 
 (def ^:dynamic *conn* nil)
 

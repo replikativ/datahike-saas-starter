@@ -1,19 +1,23 @@
-(ns datahike-saas.core
-  "HTTP service entry point. Wires the tenant pool + reitit router + Jetty.
+(ns datahike-saas.kernel.server
+  "HTTP service kernel. Wires the tenant pool + reitit router + Jetty, and resolves the
+   node's ROLE (single writer / Tier-3 direct reader / Tier-4 streaming) from SAAS_ROLE.
+
+   KERNEL namespace — domain-agnostic. It knows nothing about the issue tracker: your
+   domain's schema and routes are INJECTED via `start!`'s `:ensure-schema` and `:routes-fn`.
+   The composition root that supplies them is `datahike-saas.example.app`.
 
    The whole service is tier-agnostic: it reads SAAS_TIER, builds the pool from
    that tier's config, and serves the same routes regardless of the store beneath."
-  (:require [datahike-saas.tenant :as tenant]
-            [datahike-saas.handlers :as handlers]
-            [datahike-saas.config :as config]
+  (:require [datahike-saas.kernel.tenant :as tenant]
+            [datahike-saas.kernel.config :as config]
+            [datahike-saas.kernel.routes :as kroutes]
             [clojure.string :as str]
             [reitit.ring :as ring]
             [reitit.ring.middleware.muuntaja :as muuntaja-mw]
             [reitit.ring.middleware.parameters :as parameters]
             [muuntaja.core :as m]
             [ring.adapter.jetty :as jetty]
-            [replikativ.logging :as log])
-  (:gen-class))
+            [replikativ.logging :as log]))
 
 (def mtj
   "Muuntaja instance with a java.util.Date-aware JSON encoder."
@@ -63,11 +67,14 @@
         (handler req)))))
 
 (defn app
+  "Build the ring handler. `routes-fn` is your domain's route contribution — a fn
+   `conn-fn -> reitit-route-data` — concatenated after the kernel's own health/lifecycle
+   routes (`kernel.routes`)."
   ([conn-fn] (app conn-fn {}))
-  ([conn-fn {:keys [read-only? writer-url pool]}]
+  ([conn-fn {:keys [read-only? writer-url pool routes-fn] :or {routes-fn (constantly [])}}]
    (ring/ring-handler
     (ring/router
-     (handlers/routes conn-fn {:pool pool})
+     (into (kroutes/kernel-routes pool) (routes-fn conn-fn))
      {:data {:muuntaja   mtj
              :middleware (cond-> [parameters/parameters-middleware
                                   muuntaja-mw/format-middleware]
@@ -76,14 +83,16 @@
     (ring/create-default-handler))))
 
 (defn- conn-source
-  "Build {:conn-fn (slug -> conn) :stop fn} for the node's role (SAAS_ROLE):
+  "Build {:conn-fn (slug -> conn) :stop fn} for the node's role (SAAS_ROLE). `:ensure-schema`
+   and `:migrations` are the injected domain schema installer / migrations resource, threaded
+   into every tenant pool this node opens.
    - reader            : Tier 3 — direct-bucket pool with a NON-streaming writer backend,
                          so @conn re-reads the branch head each deref and follows the writer
    - writer-streaming  : Tier 4 — kabel server; streams each commit to readers
    - reader-streaming  : Tier 4 — kabel client on a tiered {lmdb, shared-bucket} store
    - else (unset)      : single node — :self writer, full read+write authority
    Streaming is resolved dynamically so the default path needs no kabel deps."
-  [role]
+  [role {:keys [ensure-schema migrations] :or {ensure-schema identity migrations "migrations"}}]
   (case role
     ;; DIRECT reader (Tier 3): shared bucket + a NON-streaming writer backend.
     ;;
@@ -98,32 +107,32 @@
     ;; (datahike.http.server), which this template does not mount; SAAS_WRITER_URL points
     ;; at the writer's *reitit* app, which has no such route. A write here would 404 from
     ;; a foreign API. So we mark the node read-only and say so with a 405 instead
-    ;; (handlers/routes), and writes go to the writer node's own HTTP API.
+    ;; (kernel.routes), and writes go to the writer node's own HTTP API.
     "reader"
     (let [base (assoc (config/base-cfg)
                       :writer (cond-> {:backend :datahike-server
                                        :url (or (System/getenv "SAAS_WRITER_URL") "http://localhost:8888")}
                                 (System/getenv "SAAS_TOKEN") (assoc :token (System/getenv "SAAS_TOKEN"))))
-          pool (tenant/create-pool {:base-cfg base})]
+          pool (tenant/create-pool {:base-cfg base :ensure-schema ensure-schema :migrations migrations})]
       {:conn-fn    (fn [slug] (tenant/borrow pool slug))
        :pool       pool
        :read-only? true
        :writer-url (or (System/getenv "SAAS_WRITER_URL") "http://localhost:8888")
        :stop       #(tenant/close-all! pool)})
 
-    ;; Optional kabel streaming (lower staleness) — datahike-saas.streaming, loaded
+    ;; Optional kabel streaming (lower staleness) — datahike-saas.kernel.streaming, loaded
     ;; dynamically so the default path needs no kabel deps.
     ("reader-streaming" "writer-streaming")
     (let [w?  (= role "writer-streaming")
-          ns' (requiring-resolve (symbol "datahike-saas.streaming" (if w? "start-writer!" "start-reader!")))
-          f   (requiring-resolve (symbol "datahike-saas.streaming" (if w? "writer-conn" "reader-conn")))
-          st  (requiring-resolve (symbol "datahike-saas.streaming" (if w? "stop-writer!" "stop-reader!")))
+          ns' (requiring-resolve (symbol "datahike-saas.kernel.streaming" (if w? "start-writer!" "start-reader!")))
+          f   (requiring-resolve (symbol "datahike-saas.kernel.streaming" (if w? "writer-conn" "reader-conn")))
+          st  (requiring-resolve (symbol "datahike-saas.kernel.streaming" (if w? "stop-writer!" "stop-reader!")))
           url (or (System/getenv "SAAS_WRITER_WS") (if w? "ws://0.0.0.0:8890" "ws://localhost:8890"))
-          ctx (ns' {:ws-url url})]
+          ctx (ns' {:ws-url url :ensure-schema ensure-schema :migrations migrations})]
       {:conn-fn (fn [slug] (f ctx slug)) :stop #(st ctx)})
 
     ;; default / "writer" / "single": :self writer — full read+write authority.
-    (let [pool (tenant/create-pool)]
+    (let [pool (tenant/create-pool {:ensure-schema ensure-schema :migrations migrations})]
       {:conn-fn (fn [slug] (tenant/borrow pool slug))
        :pool    pool
        :stop    #(tenant/close-all! pool)})))
@@ -179,14 +188,21 @@
                          "branch head and it would serve a FROZEN snapshot.")})))
 
 (defn start!
+  "Start the HTTP service. Options:
+   - `:port`          Jetty port (default 8888).
+   - `:ensure-schema` fn conn -> conn installing your domain schema on tenant open.
+   - `:migrations`    migrations resource dir (default \"migrations\").
+   - `:routes-fn`     fn conn-fn -> reitit-route-data — your domain's routes."
   ([] (start! {}))
-  ([{:keys [port] :or {port 8888}}]
+  ([{:keys [port ensure-schema migrations routes-fn]
+     :or {port 8888 ensure-schema identity migrations "migrations" routes-fn (constantly [])}}]
    (when @state (throw (ex-info "already running" {})))
    (let [role (System/getenv "SAAS_ROLE")
          _    (check-role! role (get-in (config/base-cfg) [:store :backend]))
-         {:keys [conn-fn stop read-only? writer-url pool]} (conn-source role)
+         {:keys [conn-fn stop read-only? writer-url pool]}
+         (conn-source role {:ensure-schema ensure-schema :migrations migrations})
          srv  (jetty/run-jetty (app conn-fn {:read-only? read-only? :writer-url writer-url
-                                             :pool pool})
+                                             :pool pool :routes-fn routes-fn})
                                {:port port :join? false})]
      (reset! state {:stop stop :server srv})
      (log/info :saas/started {:port port :tier (config/current-tier)
@@ -198,9 +214,3 @@
     (.stop server)
     (stop)
     (reset! state nil)))
-
-(defn -main [& _]
-  (let [port (Integer/parseInt (or (System/getenv "PORT") "8888"))]
-    (start! {:port port})
-    (log/info :saas/ready {:port port :tier (config/current-tier)})
-    @(promise)))

@@ -9,9 +9,10 @@
    writer with no sync. If that is true, each deref must cost at least one GET. This
    measures whether it actually does — the in-process timing cannot tell you, because
    a cached head read looks identical to no read at all."
-  (:require [datahike-saas.tenant :as tenant]
-            [datahike-saas.domain :as dom]
-            [datahike-saas.config :as config]
+  (:require [datahike-saas.kernel.tenant :as tenant]
+            [datahike-saas.kernel.config :as config]
+            [datahike-saas.example.schema :as schema]
+            [datahike-saas.example.domain :as dom]
             [datahike.http.writer])
   (:import [java.util UUID]))
 
@@ -19,7 +20,7 @@
   (let [n     (Long/parseLong (or n-str "20"))
         slug  (str "rg-" (subs (str (UUID/randomUUID)) 0 8))
         sid   (tenant/tenant-id->uuid slug)
-        wpool (tenant/create-pool)
+        wpool (schema/create-pool)
         wc    (tenant/borrow wpool slug)]
     (dom/ensure-user! wc "alice" "Alice")
     (dotimes [i 5] (dom/create-issue! wc {:title (str "i" i) :reporter "alice"}))
@@ -28,7 +29,7 @@
     ;; Fresh JVM-local reader pool, non-streaming writer backend, SAME shared store.
     (let [rbase (assoc (config/base-cfg) :writer {:backend :datahike-server
                                                   :url "http://localhost:8888"})
-          rpool (tenant/create-pool {:base-cfg rbase})
+          rpool (schema/create-pool {:base-cfg rbase})
           rc    (tenant/borrow rpool slug)]
       (dotimes [_ 3] (dom/open-issues @rc))       ;; warm node cache; head still re-read
       (println "MARK-BEGIN")

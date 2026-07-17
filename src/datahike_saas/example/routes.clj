@@ -1,13 +1,12 @@
-(ns datahike-saas.handlers
-  "Tenant-scoped HTTP API over the issue-tracker domain. JSON in/out.
+(ns datahike-saas.example.routes
+  "Tenant-scoped HTTP routes for the issue-tracker domain. JSON in/out.
 
-   Routes are `/t/:tenant/...` — the tenant slug selects the Datahike connection
-   via a `conn-fn` (slug -> connection). That indirection is the only tier-aware
-   seam: a Tier 1/2/3 node passes `#(tenant/borrow pool %)` (shared bucket; a Tier-3
-   reader differs only in its non-streaming `:writer` backend), while a Tier-4
-   streaming reader passes `#(streaming/reader-conn ctx %)` (tiered lmdb+s3,
-   kabel-followed).
-   The handlers themselves are a thin shell over `datahike-saas.domain`.
+   The DOMAIN's route contribution. `routes` is the fn you hand the kernel as `:routes-fn`
+   (see `datahike-saas.example.app`); `kernel.server/app` concatenates it after the kernel's
+   own health/lifecycle routes. It closes over a `conn-fn` (slug -> connection) — the only
+   tier-aware seam: a single/Tier-1/2/3 node passes `#(tenant/borrow pool %)`, a Tier-4
+   streaming reader passes `#(streaming/reader-conn ctx %)`. The handlers themselves are a
+   thin shell over `datahike-saas.example.domain`.
 
    ⚠️ THERE IS NO AUTHENTICATION HERE. The tenant slug is read straight from the URL
    path, so anyone who knows a slug can read that tenant. This is a template: put your
@@ -16,9 +15,9 @@
    this repo argues for is *storage* isolation (a bug in your app can't leak across
    tenants, because the slug selects a different DATABASE, not a WHERE clause) — it is
    not a substitute for authenticating the caller."
-  (:require [datahike-saas.domain :as dom]
-            [datahike-saas.lifecycle :as lc])
-  (:import [java.util UUID]))
+  (:require [datahike-saas.example.domain :as dom]
+            [datahike-saas.example.attachments :as att])
+  (:import [java.util UUID Base64]))
 
 (defn- conn [conn-fn req] (conn-fn (get-in req [:path-params :tenant])))
 
@@ -26,46 +25,13 @@
 (defn- created [body] {:status 201 :body body})
 (defn- not-found [] {:status 404 :body {:error "not found"}})
 
-(declare base-routes lifecycle-routes)
+(defn- b64-decode ^bytes [^String s] (.decode (Base64/getDecoder) s))
+(defn- b64-encode ^String [^bytes b] (.encodeToString (Base64/getEncoder) b))
 
 (defn routes
-  "Reitit route data for the tenant API, closing over `conn-fn` (slug -> conn).
-
-   `opts` may carry `:pool` — the tenant registry. Given one, the tenant-LIFECYCLE routes
-   are mounted (export / delete): they operate on the DATABASE, not on rows, so they need
-   the pool rather than a single connection. A Tier-4 streaming reader has no pool and
-   simply doesn't get them; a Tier-3 reader has one, but the read-only middleware
-   (`core/read-only-mw`) still refuses its DELETE — deletion is the writer's job."
-  ([conn-fn] (routes conn-fn {}))
-  ([conn-fn {:keys [pool]}]
-   (cond-> (base-routes conn-fn)
-     pool (conj (lifecycle-routes pool)))))
-
-(defn- lifecycle-routes
-  "A tenant is a database, so offboarding is a DELETE and takeout is a GET."
-  [pool]
-  ["/t/:tenant"
-   ["/export"
-    {:get (fn [req]
-            (let [slug (get-in req [:path-params :tenant])]
-              {:status 200
-               :headers {"content-type" "application/edn"
-                         "content-disposition" (str "attachment; filename=\"" slug ".edn\"")}
-               :body (lc/export-edn pool slug)}))}]
-   [""
-    {:delete (fn [req]
-               (let [slug (get-in req [:path-params :tenant])]
-                 ;; Deletes the tenant's DATABASE. Complete by construction: their data
-                 ;; lives in no other tenant's database, so there is nowhere else to sweep.
-                 (if (lc/delete-tenant! pool slug)
-                   (ok {:deleted slug})
-                   (not-found))))}]])
-
-(defn- base-routes
+  "Reitit route data for the issue-tracker API, closing over `conn-fn` (slug -> conn)."
   [conn-fn]
-  [["/health" {:get (fn [_] (ok {:status "ok"}))}]
-
-   ["/t/:tenant"
+  [["/t/:tenant"
     ["/issues"
      {:get  (fn [req] (ok {:issues (dom/open-issues @(conn conn-fn req))}))
       :post (fn [req]
@@ -95,6 +61,22 @@
               (let [id (UUID/fromString (get-in req [:path-params :id]))]
                 (dom/close! (conn conn-fn req) id)
                 (ok {:ok true})))}]
+
+    ;; In-store blob attachment (:db.type/store-ref). Bytes come base64 in the JSON body —
+    ;; enough to demonstrate the round-trip over the API without multipart plumbing; for
+    ;; large files use the presigned-S3-direct shape instead (see doc/blobs.md).
+    ["/issues/:id/attachments"
+     {:post (fn [req]
+              (let [id (UUID/fromString (get-in req [:path-params :id]))
+                    {:keys [filename content-type data]} (:body-params req)]
+                (created {:blob-id (str (att/attach! (conn conn-fn req) id
+                                                     {:filename filename
+                                                      :content-type content-type
+                                                      :bytes (b64-decode data)}))})))}]
+    ["/attachments/:blob-id"
+     {:get (fn [req]
+             (let [bid (UUID/fromString (get-in req [:path-params :blob-id]))]
+               (ok {:blob-id (str bid) :data (b64-encode (att/fetch (conn conn-fn req) bid))})))}]
 
     ["/stats" {:get (fn [req] (ok (dom/stats @(conn conn-fn req))))}]
     ["/search" {:get (fn [req] (ok {:results (dom/search @(conn conn-fn req)

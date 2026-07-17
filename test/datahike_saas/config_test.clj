@@ -1,7 +1,7 @@
 (ns datahike-saas.config-test
   "The tier profiles resolve to the expected store shapes — the config-swap spine."
   (:require [clojure.test :refer [deftest is testing]]
-            [datahike-saas.config :as config]))
+            [datahike-saas.kernel.config :as config]))
 
 (deftest tier1-is-minio-s3
   (let [{:keys [store] :as cfg} (config/base-cfg :tier1)]

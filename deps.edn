@@ -5,18 +5,21 @@
 
   ;; The multi-tenant object-store write path. These are minimum versions — the
   ;; features this template is built on landed across them:
-  ;;  - datahike 0.8.1731   diff-buf write-buffering, index-root fusion and the
+  ;;  - datahike 0.8.1735   diff-buf write-buffering, index-root fusion and the
   ;;                        commit-graph opt-out (the per-store write-amplification
   ;;                        knobs); concurrent background GC; per-tenant delete;
-  ;;                        Tier-4 streaming replicas.
-  ;;  - konserve 0.9.359    single-request reads (PReadMissSafe), ordered multi-assoc,
-  ;;                        tiered stores that never write through a read-only backend.
+  ;;                        Tier-4 streaming replicas; and :db.type/store-ref — blobs
+  ;;                        and out-of-line values the GC marks (the attachment demo,
+  ;;                        see doc/blobs.md).
+  ;;  - konserve 0.9.362    single-request reads (PReadMissSafe), ordered multi-assoc,
+  ;;                        tiered stores that never write through a read-only backend,
+  ;;                        binary bget/bassoc for in-store blobs.
   ;;  - konserve-s3 0.1.35  shared S3 clients + marker registry (multi-tenant
   ;;                        de-contention), virtual-thread IO, one round-trip per PUT.
-  ;; persistent-sorted-set arrives transitively via datahike.
-  org.replikativ/datahike    {:mvn/version "0.8.1731"}
+  ;; persistent-sorted-set + hasch arrive transitively via datahike.
+  org.replikativ/datahike    {:mvn/version "0.8.1735"}
   org.replikativ/konserve-s3 {:mvn/version "0.1.35"}
-  org.replikativ/konserve    {:mvn/version "0.9.359"}
+  org.replikativ/konserve    {:mvn/version "0.9.362"}
 
   ;; Config as data — one file, four tier profiles (see resources/config.edn).
   aero/aero {:mvn/version "1.1.6"}
@@ -59,7 +62,7 @@
   ;; LMDB tier (Tier 4). konserve-lmdb arrives transitively via datahike-lmdb.
   :lmdb {:extra-deps {org.replikativ/datahike-lmdb {:mvn/version "0.1.8"}}}
 
-  :run {:main-opts ["-m" "datahike-saas.core"]}
+  :run {:main-opts ["-m" "datahike-saas.example.app"]}
 
   ;; Tests — in-memory (:memory backend), no MinIO needed.
   ;;   clj -M:test         (main entry)   |   clj -X:test  (CI, via bin/run-unittests)

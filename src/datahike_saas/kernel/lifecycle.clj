@@ -1,5 +1,9 @@
-(ns datahike-saas.lifecycle
+(ns datahike-saas.kernel.lifecycle
   "Tenant lifecycle: export, delete, restore.
+
+   KERNEL namespace — domain-agnostic. `restore-tenant!` installs the target schema via the
+   pool's INJECTED `:ensure-schema` fn (see `kernel.tenant/create-pool`), so nothing here knows
+   about the issue-tracker example.
 
    This is the payoff of db-per-tenant, and the reason the model is worth the trouble.
    Because a tenant IS a database — not rows tagged with a `tenant_id` — the operations
@@ -20,8 +24,7 @@
    The pool is a cache of open connections, so mutating a tenant's database means
    evicting it first; `borrow` reopens on next use."
   (:require [datahike.api :as d]
-            [datahike-saas.tenant :as tenant]
-            [datahike-saas.schema :as schema]
+            [datahike-saas.kernel.tenant :as tenant]
             [replikativ.logging :as log]))
 
 ;; ── export ──────────────────────────────────────────────────────────────────
@@ -95,6 +98,9 @@
    how you get a staging copy of a customer, or reproduce a support ticket against
    their real data, without touching production.
 
+   The target schema is installed by the pool's injected `:ensure-schema` (via `borrow`),
+   so restore knows the attribute types before it replays a single datom.
+
    Entity ids are NOT preserved — the target assigns its own — so every `:db.type/ref` has
    to be rewritten, or the restore silently drops the graph. A ref's stored value is an
    entity id in the SOURCE database; replaying it verbatim points at nothing (or, worse, at
@@ -117,8 +123,7 @@
       (throw (ex-info "Refusing to restore over an existing tenant — delete it first."
                       {:tenant target-slug})))
     (d/create-database cfg)
-    (let [conn (tenant/borrow pool target-slug)]
-      (schema/ensure-schema! conn)                 ;; schema first: attribute types must be known
+    (let [conn (tenant/borrow pool target-slug)]     ;; borrow installs schema via :ensure-schema
       (let [db        @conn
             alive     (remove (fn [[_ _ _ _ added]] (false? added)) datoms)
             by-e      (group-by first alive)
@@ -149,5 +154,5 @@
                         m)]
         (when (seq tx-data)
           (d/transact conn (vec tx-data)))
-      (log/info :tenant/restored {:tenant target-slug :entities (count tx-data)}))
+        (log/info :tenant/restored {:tenant target-slug :entities (count tx-data)}))
       conn)))
