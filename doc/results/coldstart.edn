@@ -1,0 +1,137 @@
+;; Cold-start read economics — what a SHORT-LIVED reader (lambda) pays for one query.
+;; Env: local MinIO + toxiproxy (bin/latency-proxy 20 => +20ms downstream), GraalVM JDK 25.
+;; Stack: datahike 0.8.1735, konserve-s3 0.1.35, konserve 0.9.362.
+;; Reproduce:
+;;   docker compose --profile tier1 up -d
+;;   bin/latency-proxy 20
+;;   MINIO_PORT=19000 SAAS_TIER=tier1 clj -M:bench -m datahike-saas.coldstart <bench> <opts>
+;;
+;; Read this with doc/cost-model.md: request PRICE is a rounding error at $0.40/M GETs.
+;; Every number below is about ROUND TRIPS.
+
+{;; ── baseline: cold connect + one open-issues query ────────────────────────
+ ;; NOTE `connect` is 1 GET at every size: with :fuse-index-roots? true the index
+ ;; roots are inlined in the db record. At 5 issues the query reads NO nodes at all —
+ ;; the fused record IS the whole database. The tree only outgrows its root later.
+ :cold
+ {:latency-ms 0                      ; localhost MinIO, no proxy
+  :rows [{:issues 5    :connect {:ms 44.2 :gets 1} :query {:ms 22.3 :gets 0}  :total {:ms 66.5  :gets 1}}
+         {:issues 100  :connect {:ms 43.3 :gets 1} :query {:ms 72.5 :gets 6}  :total {:ms 115.9 :gets 7}}
+         {:issues 400  :connect {:ms 48.2 :gets 1} :query {:ms 295.6 :gets 20} :total {:ms 343.7 :gets 21}}
+         {:issues 1200 :connect {:ms 29.0 :gets 1} :query {:ms 421.5 :gets 57} :total {:ms 450.5 :gets 58}}]}
+
+ ;; ── read amplification: whole store vs what one query touches ─────────────
+ ;; Decides whether "preload the whole database" is sane. It is sane exactly when
+ ;; total is within a small multiple of the working set — which is what a
+ ;; per-tenant database buys you, and what one big shared database does not.
+ :shape
+ {:latency-ms 20
+  :rows [{:issues 5   :objects 8   :query-gets 1  :amplification 8.0}
+         {:issues 100 :objects 28  :query-gets 7  :amplification 4.0}
+         {:issues 400 :objects 197 :query-gets 21 :amplification 9.4}]}
+
+ ;; ── THE measurement: same key set, increasing concurrency ─────────────────
+ ;; Nothing changes about WHAT is fetched — only how many are in flight. The
+ ;; spread is pure serialization, and it is recoverable for free.
+ ;; konserve-s3 implements neither PMultiReadBackingStore nor
+ ;; PMultiWriteBackingStore, so konserve's sync-keys-to-frontend and
+ ;; konserve.gc/sweep! both take their serial fallback path today.
+ :fanout
+ [{:latency-ms 0 :issues 1200 :objects 878
+   :list-keys-ms 4636.2               ; konserve list-keys: 1 serial GET per object
+   :rows [{:width 1 :ms 4264.7 :per-object-ms 4.86 :speedup 1.0}
+          {:width 4 :ms 908.3 :per-object-ms 1.03 :speedup 4.7}
+          {:width 16 :ms 726.8 :per-object-ms 0.83 :speedup 5.9}
+          {:width 64 :ms 677.1 :per-object-ms 0.77 :speedup 6.3}
+          {:width 128 :ms 842.4 :per-object-ms 0.96 :speedup 5.1}]}
+  {:latency-ms 20 :issues 400 :objects 197
+   :list-keys-ms 6008.7               ; as much as the entire fetch
+   :rows [{:width 1 :ms 5843.6 :per-object-ms 29.66 :speedup 1.0}
+          {:width 4 :ms 1526.2 :per-object-ms 7.75 :speedup 3.8}
+          {:width 16 :ms 468.8 :per-object-ms 2.38 :speedup 12.5}
+          {:width 64 :ms 357.0 :per-object-ms 1.81 :speedup 16.4}
+          {:width 128 :ms 453.2 :per-object-ms 2.30 :speedup 12.9}]}]
+
+ ;; ── preload everything at connect (tiered {memory, s3}) ───────────────────
+ ;; This is NOT a proposal — it is what datahike does TODAY for a :tiered store.
+ ;; `ready-store :tiered` (datahike store.cljc) runs konserve's
+ ;; populate-missing-strategy on connect, hardcoded, with no strategy option.
+ ;; The query afterwards is genuinely free (0 GETs, ~1-3ms). Getting there is not.
+ ;; connect-gets ~= 2x objects: perform-sync calls -keys on the backing (list-keys
+ ;; = 1 GET/object) and then fetches every key again.
+ :preload
+ {:latency-ms 20
+  :rows [{:issues 100 :naive {:ms 386.3 :gets 7}  :connect {:ms 3179.0 :gets 56}  :query {:ms 3.2 :gets 0}}
+         {:issues 400 :naive {:ms 735.8 :gets 21} :connect {:ms 11836.4 :gets 392} :query {:ms 1.0 :gets 0}}]}
+
+ ;; ── budget-bounded BFS warm (datahike_saas.kernel.warm) ───────────────────
+ ;; Walks the tree from the ROOT, fetching each level concurrently. Reaches the
+ ;; same end state as the full preload above — query at 0 GETs — for 37 fetches
+ ;; instead of 392 and 438 ms instead of 11836 ms (27x).
+ ;;
+ ;; Two reasons it wins, and only one of them is concurrency:
+ ;;   - it walks, so it touches only REACHABLE nodes (37, against 40 live and 197
+ ;;     total). No -keys enumeration, no garbage. The walk-sync property, obtained
+ ;;     by construction rather than by a separate strategy.
+ ;;   - it fetches each level in one wave.
+ ;; A fixed `perform-sync` (walk-based + parallel) would land near this. The warm's
+ ;; durable advantage over that is the BUDGET: it degrades on a store too large to
+ ;; hold, instead of refusing to finish.
+ ;;
+ ;; NOTE :interior fetches 0 here and that is CORRECT — at 100-400 issues the eavt
+ ;; tree is height 1, so the interior IS the root, which :fuse-index-roots? already
+ ;; delivers with the connect's single GET. These tenants are structurally too small
+ ;; to have an interior layer at branching factor 512.
+ :warm
+ {:latency-ms 20
+  :store-cache-size 8192
+  :rows [{:issues 100 :depth :interior    :budget 2000
+          :connect {:ms 124.2 :gets 1} :warm {:ms 0.9 :gets 0}   :query {:ms 240.1 :gets 6} :total-ms 365.2}
+         {:issues 100 :depth :with-leaves :budget 2000
+          :connect {:ms 120.0 :gets 1} :warm {:ms 97.9 :gets 9}  :query {:ms 17.6 :gets 0} :total-ms 235.5}
+         {:issues 100 :depth :with-leaves :budget 8
+          :connect {:ms 111.9 :gets 1} :warm {:ms 87.2 :gets 8}  :query {:ms 57.0 :gets 1} :total-ms 256.1}
+         {:issues 400 :depth :interior    :budget 2000
+          :connect {:ms 127.3 :gets 1} :warm {:ms 0.1 :gets 0}   :query {:ms 560.8 :gets 20} :total-ms 688.2}
+         {:issues 400 :depth :with-leaves :budget 2000
+          :connect {:ms 140.9 :gets 1} :warm {:ms 246.3 :gets 37} :query {:ms 50.7 :gets 0} :total-ms 437.9}
+         {:issues 400 :depth :with-leaves :budget 8
+          :connect {:ms 114.0 :gets 1} :warm {:ms 41.9 :gets 8}  :query {:ms 385.4 :gets 12} :total-ms 541.2}]
+  ;; The budget-8 rows are the cliff-freedom claim as a measurement: a partial warm
+  ;; gives a partial saving (query 21->12 GETs at 400 issues) and the total lands
+  ;; BETWEEN naive and fully-warmed. No step, no mode change, nothing to fall off.
+  :no-discontinuity? true}
+
+ ;; ── multi-round BFS on a DEEP tree ────────────────────────────────────────
+ ;; The rows above cannot exercise :interior (height 1). Re-seeded at branching
+ ;; factor 32 so height 3 is reachable in ~20k datoms instead of ~250k; the walk
+ ;; logic is bf-independent, only the interior/total RATIO is not.
+ :deep-tree
+ {:branching-factor 32 :issues 2500 :height 3
+  :rows [{:depth :interior    :fetched 93   :by-level [5 88]      :rounds 2}
+         {:depth :with-leaves :fetched 1504 :by-level [5 88 1411] :rounds 3}
+         {:depth 1            :fetched 5    :by-level [5]         :rounds 1}]
+
+  ;; :interior stops exactly at the leaf boundary — 93 of 1504 nodes, 2 rounds
+  ;; instead of 3 — with no rule enforcing it. Leaves are level 0, so BFS
+  ;; terminates there by itself. An integer depth cuts at exactly that many levels.
+
+  ;; CORRECTION to the 1/branching-factor estimate used earlier in this thread.
+  ;; Measured interior share is 93/1504 = 6.2%, not 1/32 = 3.1%. The nodes are
+  ;; ~50% full (1411 leaves under 88 parents = ~16 children each, not 32), so the
+  ;; EFFECTIVE fanout is about half the branching factor and the interior is ~2x
+  ;; the naive estimate: interior/total ~= 2/bf, not 1/bf.
+  ;;
+  ;; At bf 512 that means ~0.4% rather than ~0.2%. For a 95,572-object store the
+  ;; interior is ~370 nodes rather than ~190 — still 2 waves at width 256, so the
+  ;; conclusion is unchanged, but the arithmetic was optimistic by 2x.
+  :effective-fanout ~16
+  :interior-share-of-total 0.062}
+
+ ;; ── what a walk-from-the-head would skip ──────────────────────────────────
+ ;; Same tenant, preload cost before vs after d/gc-storage. Enumerate-the-bucket
+ ;; fetches the garbage too; konserve.tiered/perform-walk-sync (root keys + a
+ ;; walk-fn, never calls -keys) would fetch only the live set. No datahike-side
+ ;; walk-fn exists to feed it yet.
+ :live-only
+ {:issues 400 :objects-before-gc 197 :objects-after-gc 40 :garbage 157 :garbage-pct 80.0}}

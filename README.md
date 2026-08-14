@@ -279,6 +279,13 @@ in [`doc/benchmarks.md`](doc/benchmarks.md). Headlines from Tier 1 (local MinIO)
   so heap tracks the *concurrently active* set, not the fleet; an evicted tenant pays ~+52 ms on
   its next request ([§3b](doc/benchmarks.md)). Throughput bites too: one node saturates near
   **~300 ops/s**.
+- **Cold start** — a short-lived reader (a lambda) pays *round trips*, not request price: wall
+  time is `misses x RTT` with **zero** overlap (measured **24.96 ms** per extra node against a
+  ~25 ms round trip). Fetching the same key set at 64-way concurrency is **16.4x** faster, and a
+  budget-bounded BFS warm reaches "the query costs 0 GETs" in **37** fetches where the tiered
+  store's built-in preload needs **392**. Small tenants need none of it — at 5 issues the fused
+  db record *is* the database, 1 GET. The cold-start problem is a *big-single-database* problem,
+  and db-per-tenant dissolves it. ([§7](doc/benchmarks.md))
 - **Cost** — object-store ops run **~1 ¢/tenant·month**; the bill is compute plus, on AWS,
   *egress to your users* — which outweighs the bucket. See [doc/cost-model.md](doc/cost-model.md).
 - **GC** — with `:commit-graph? false` no commit record pins an old index root, so essentially
