@@ -448,3 +448,124 @@ frontend-only — but sweeping the frontend directly says what you mean under an
 > The demo reaches datahike's private reachability walk to stay self-contained; for real use
 > the reader consumes the writer's published reachable set, so datahike exposing a public
 > `reachable-keys` would make this a clean two-liner.
+
+## 7. Cold start — what a short-lived reader pays (`coldstart`)
+
+Tiers 3 and 4 both assume a **long-lived** process: one keeps a warm node cache, the other a warm
+local LMDB. A lambda has neither — it opens a store, answers one request, and dies. This bench
+measures that case, and which candidate fix actually moves it.
+
+Not a cost question. At $0.40/M ([cost-model.md](cost-model.md)) a hundred GETs cost $0.00004.
+What a cold reader pays is **round trips**, in two kinds that respond to opposite fixes:
+*depth-serial* (root→branch→leaf within one lookup, bounded by tree depth) and *breadth-serial*
+(N independent lookups issued one after another, bounded by the working set).
+
+```bash
+docker compose --profile tier1 up -d
+bin/latency-proxy 20
+MINIO_PORT=19000 SAAS_TIER=tier1 clj -M:bench -m datahike-saas.coldstart compare
+```
+
+### Concurrency is the whole game (`fanout`, +20 ms)
+
+The **same 197 keys**, only the number in flight changes:
+
+| in flight | ms | ms/object | speedup |
+|--:|--:|--:|--:|
+| 1 (today) | 5843.6 | 29.66 | 1.0× |
+| 4 | 1526.2 | 7.75 | 3.8× |
+| 16 | 468.8 | 2.38 | 12.5× |
+| 64 | **357.0** | 1.81 | **16.4×** |
+| 128 | 453.2 | 2.30 | 12.9× |
+
+Nothing about *what* is fetched changes — the spread is pure serialization. On localhost the same
+spread is 6.3×, so it **widens** with real object-store latency. konserve-s3 implements neither
+`PMultiReadBackingStore` nor `PMultiWriteBackingStore`, so konserve's `sync-keys-to-frontend` and
+`konserve.gc/sweep!` both take their serial fallback today.
+
+### Preloading everything is 8–16× slower than not bothering (`preload`, +20 ms)
+
+Not a proposal — it is what datahike does **today** for a `:tiered` store: `ready-store :tiered`
+runs konserve's `populate-missing-strategy` on connect, hardcoded, with no strategy option.
+
+| issues | naive ms / GETs | preload connect ms / GETs | then query ms / GETs |
+|--:|--:|--:|--:|
+| 100 | 386.3 / 7 | 3179.0 / 56 | 3.2 / **0** |
+| 400 | 735.8 / 21 | 11836.4 / 392 | 1.0 / **0** |
+
+The warm query really is free. Getting there is not — and it is paid *twice*: `connect` GETs run
+~2× the object count, because `perform-sync` enumerates with `-keys` (konserve's `list-keys` opens
+every blob to read its metadata — 6.0 s on its own here) and then re-fetches every key.
+
+### 80% of a full preload is garbage (`live`)
+
+Same tenant, before and after `d/gc-storage`: **197 → 40 objects**. Enumerate-the-bucket fetches
+the garbage too; `konserve.tiered/perform-walk-sync` (root keys + a walk-fn, never calls `-keys`)
+would fetch only the live set — but no datahike-side walk-fn exists to feed it yet.
+
+### Budget-bounded BFS warm beats full preload by 27× (`warm`)
+
+`d/warm-db` — prototyped in this repo, now **released in datahike** (0.8.1779, experimental) —
+walks the tree from the **root**, fetching each level
+concurrently, bounded by a `:depth` policy (`:interior` / `:with-leaves` / an integer) and a
+node `:budget`. 400 issues, +20 ms, three phases counted separately:
+
+| strategy | connect | warm | query | **total** |
+|---|--:|--:|--:|--:|
+| naive | — | — | 735.8 ms / 21 GETs | **735.8 ms** |
+| `:with-leaves` budget 2000 | 140.9 / 1 | 246.3 / **37** | 50.7 / **0** | **437.9 ms** |
+| `:with-leaves` budget 8 | 114.0 / 1 | 41.9 / 8 | 385.4 / 12 | 541.2 ms |
+| tiered `{memory,s3}` preload | 11836.4 / **392** | — | 1.0 / 0 | **11837 ms** |
+
+Same end state as the full preload — **query at 0 GETs** — for 37 fetches instead of 392.
+Two reasons, and only one is concurrency: it **walks**, so it touches only *reachable* nodes
+(37, against 40 live and 197 total) and never enumerates the bucket. It gets the walk-sync
+property by construction rather than as a separate strategy.
+
+> A fixed `perform-sync` (walk-based *and* parallel) would land near this. The warm's durable
+> advantage over that is the **budget** — it degrades on a store too large to hold rather than
+> refusing to finish.
+
+**The budget-8 row is the cliff-freedom claim as a measurement**: a partial warm gives a partial
+saving (query 21 → 12 GETs) and the total lands *between* naive and fully-warmed. No step, no
+mode switch. `:with-leaves` with a budget above the object count simply runs out of frontier —
+"preload everything" is not a separate mode, it is what the same loop does on a small store.
+
+> `:interior` fetches **0** at these sizes, correctly: the eavt tree is **height 1**, so the
+> interior *is* the root, which `:fuse-index-roots?` already delivers with the connect's single
+> GET. Our tenants are structurally too small to have an interior layer at branching factor 512.
+
+To exercise a multi-round walk, re-seeded at **branching factor 32** so height 3 is reachable in
+~20k datoms (the walk is bf-independent; only the interior/total *ratio* is not):
+
+| depth | fetched | by level | rounds |
+|---|--:|---|--:|
+| `:interior` | 93 | `[5 88]` | 2 |
+| `:with-leaves` | 1504 | `[5 88 1411]` | 3 |
+| `1` | 5 | `[5]` | 1 |
+
+`:interior` stops exactly at the leaf boundary with no rule enforcing it — leaves are level 0, so
+BFS terminates there by itself.
+
+> ⚠️ **The 1/branching-factor estimate is optimistic by 2×.** Measured interior share is
+> 93/1504 = **6.2%**, not 1/32 = 3.1%: nodes sit ~50% full (1411 leaves under 88 parents ≈ 16
+> children each, not 32), so the *effective* fanout is about half the branching factor and
+> `interior/total ≈ 2/bf`. At bf 512 that is ~0.4%, not ~0.2% — for a 95,572-object store, ~370
+> interior nodes rather than ~190. Still 2 waves at width 256, so the strategy is unaffected,
+> but size a budget from the measured ratio, not the branching factor.
+
+### Small tenants are already optimal (`cold`)
+
+| issues | connect ms / GETs | query ms / GETs |
+|--:|--:|--:|
+| 5 | 44.2 / 1 | 22.3 / **0** |
+| 100 | 43.3 / 1 | 72.5 / 6 |
+| 400 | 48.2 / 1 | 295.6 / 20 |
+| 1200 | 29.0 / 1 | 421.5 / 57 |
+
+`connect` is **1 GET at every size** — with `:fuse-index-roots? true` the index roots are inlined
+in the db record. At 5 issues the query then reads *no nodes at all*: the fused record **is** the
+database. Worth stating plainly, because it means the cold-start problem is a
+**big-single-database** problem, and db-per-tenant is what dissolves it.
+
+Raw numbers: [doc/results/coldstart.edn](results/coldstart.edn).

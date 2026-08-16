@@ -11,7 +11,7 @@
 (defn- mem-pool [max-hot]
   ;; schema/create-pool = kernel pool + the issue-tracker schema injected as :ensure-schema.
   (schema/create-pool {:max-hot max-hot
-                       :base-cfg {:store {:backend :memory}
+                       :base-cfg {:value-caps :default :store {:backend :memory}
                                   :keep-history? false
                                   :schema-flexibility :write
                                   :index :datahike.index/persistent-set}}))

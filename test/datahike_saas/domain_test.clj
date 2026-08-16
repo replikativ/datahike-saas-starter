@@ -8,7 +8,7 @@
 (def ^:dynamic *conn* nil)
 
 (defn mem-conn-fixture [f]
-  (let [cfg {:store {:backend :memory :id (random-uuid)}
+  (let [cfg {:value-caps :default :store {:backend :memory :id (random-uuid)}
              :keep-history? false}]
     (d/create-database cfg)
     (let [conn (schema/ensure-schema! (d/connect cfg))]

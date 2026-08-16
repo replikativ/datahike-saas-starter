@@ -206,6 +206,14 @@ Odoo, Flyway) talk to it with no Postgres install. Point it at the store profile
 result is **db-per-tenant Postgres on object storage**, scaling horizontally the same way — you
 keep your ORM and your migrations.
 
+**No server at all?** [**datahike-serverless**](https://github.com/replikativ/datahike-serverless)
+is the same store on ephemeral compute — AWS Lambda first, with Cloud Run and Fly as sibling
+profiles. It is the opposite trade to the ladder here: a tenant that nobody touches costs
+*storage only*, and you pay the cold start instead of an instance. Worth reading its
+measurements before choosing — the crossover is real, and **small tenants like this
+template's need none of it** (at 5 issues the fused db record *is* the database: 1 GET, zero
+node reads, [§7](doc/benchmarks.md)). Cold start is a big-single-database problem.
+
 **Your storage isn't S3?** The `:store` is just a [konserve](https://github.com/replikativ/konserve)
 backend, and there are many: **GCS**, **JDBC**, DynamoDB, Redis, RocksDB, LevelDB, LMDB, the
 filesystem, in-memory. Anything with similar economics slots into the same four-tier story, and
@@ -279,6 +287,13 @@ in [`doc/benchmarks.md`](doc/benchmarks.md). Headlines from Tier 1 (local MinIO)
   so heap tracks the *concurrently active* set, not the fleet; an evicted tenant pays ~+52 ms on
   its next request ([§3b](doc/benchmarks.md)). Throughput bites too: one node saturates near
   **~300 ops/s**.
+- **Cold start** — a short-lived reader (a lambda) pays *round trips*, not request price: wall
+  time is `misses x RTT` with **zero** overlap (measured **24.96 ms** per extra node against a
+  ~25 ms round trip). Fetching the same key set at 64-way concurrency is **16.4x** faster, and a
+  budget-bounded BFS warm reaches "the query costs 0 GETs" in **37** fetches where the tiered
+  store's built-in preload needs **392**. Small tenants need none of it — at 5 issues the fused
+  db record *is* the database, 1 GET. The cold-start problem is a *big-single-database* problem,
+  and db-per-tenant dissolves it. ([§7](doc/benchmarks.md))
 - **Cost** — object-store ops run **~1 ¢/tenant·month**; the bill is compute plus, on AWS,
   *egress to your users* — which outweighs the bucket. See [doc/cost-model.md](doc/cost-model.md).
 - **GC** — with `:commit-graph? false` no commit record pins an old index root, so essentially
