@@ -73,7 +73,6 @@
             [datahike-saas.example.domain :as dom]
             [konserve.core :as k]
             [konserve-s3.core :as s3]
-            [datahike-saas.kernel.warm :as warm]
             [clojure.edn :as edn]
             [clojure.string :as str])
   (:import [java.util UUID]
@@ -232,14 +231,14 @@
    Three phases, each counted separately, because the whole question is whether
    the warm's cost is repaid by the query's saving. `:store-cache-size` is raised
    to hold the budget — leaving it at the default 64 would fetch the warm and then
-   evict it, which `warm/warm-db!` clamps against rather than doing silently."
+   evict it, which `d/warm-db` clamps against rather than doing silently."
   [slug {:keys [depth budget width cache-size]
          :or   {depth :with-leaves budget 2000 width 64 cache-size 8192}}]
   (let [cfg  (assoc (reader-cfg slug) :store-cache-size cache-size)
         c    (probed (d/connect cfg))
         conn (:result c)]
     (try
-      (let [w (probed (warm/warm-db! @conn {:depth depth :budget budget :width width}))
+      (let [w (probed (d/warm-db @conn {:depth depth :budget budget :width width}))
             q (probed (query! @conn))]
         {:connect {:ms (:ms c) :gets (:gets c)}
          :warm    {:ms (:ms w) :gets (:gets w) :report (:result w)}

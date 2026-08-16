@@ -505,7 +505,8 @@ would fetch only the live set — but no datahike-side walk-fn exists to feed it
 
 ### Budget-bounded BFS warm beats full preload by 27× (`warm`)
 
-`datahike_saas.kernel.warm` walks the tree from the **root**, fetching each level
+`d/warm-db` — prototyped in this repo, now **released in datahike** (0.8.1779, experimental) —
+walks the tree from the **root**, fetching each level
 concurrently, bounded by a `:depth` policy (`:interior` / `:with-leaves` / an integer) and a
 node `:budget`. 400 issues, +20 ms, three phases counted separately:
 

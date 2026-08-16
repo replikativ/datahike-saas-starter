@@ -64,7 +64,7 @@
   :rows [{:issues 100 :naive {:ms 386.3 :gets 7}  :connect {:ms 3179.0 :gets 56}  :query {:ms 3.2 :gets 0}}
          {:issues 400 :naive {:ms 735.8 :gets 21} :connect {:ms 11836.4 :gets 392} :query {:ms 1.0 :gets 0}}]}
 
- ;; ── budget-bounded BFS warm (datahike_saas.kernel.warm) ───────────────────
+ ;; ── budget-bounded BFS warm (prototyped here; now datahike d/warm-db) ─────
  ;; Walks the tree from the ROOT, fetching each level concurrently. Reaches the
  ;; same end state as the full preload above — query at 0 GETs — for 37 fetches
  ;; instead of 392 and 438 ms instead of 11836 ms (27x).
@@ -135,3 +135,127 @@
  ;; walk-fn exists to feed it yet.
  :live-only
  {:issues 400 :objects-before-gc 197 :objects-after-gc 40 :garbage 157 :garbage-pct 80.0}}
+
+;; ── Tier 5: the same app on AWS Lambda, locally ───────────────────────────
+;; Runtime Interface Emulator + MinIO (bin/lambda-demo). Identical images; the
+;; only difference is SAAS_WARM_TENANTS. Tenant: 201 issues, verified by both
+;; readers returning the same 201 results from the shared bucket.
+;;
+;; The three entry points cost wildly different amounts, and only one of them is
+;; what people mean by "cold start":
+{:tier5-lambda
+ {:tenant-issues 201
+  :phases
+  {:reader-no-warm   {:init   {:ms 238.3  :gets 0  :puts 0}
+                      :first  {:ms 3218.1 :gets 18 :puts 2}
+                      :warm   {:ms 18.7   :gets 1  :puts 0}}
+   :reader-init-warm {:init   {:ms 3495.1 :gets 24 :puts 2}   ; SAAS_WARM_TENANTS=acme
+                      :first  {:ms 204.6  :gets 1  :puts 0}   ; 15.7x faster, 18 GETs -> 1
+                      :warm   {:ms 14.8   :gets 1  :puts 0}}}
+
+  ;; 1. Warming at INIT moves the work off the request path: first invocation
+  ;;    3218ms/18 GETs -> 205ms/1 GET. The remaining GET is the branch-head
+  ;;    re-read, which is the Tier-3 tax (bin/reader-gets measures 1.00 GET/deref)
+  ;;    showing up on the Lambda path exactly as priced.
+  ;;
+  ;; 2. WITHOUT SnapStart this is a wash, slightly negative: 238+3218 = 3456ms
+  ;;    against 3495+205 = 3700ms, because the warm fetches more (24) than the
+  ;;    query needs (18). INIT-warming pays off only when INIT is amortised —
+  ;;    i.e. under SnapStart (once per PUBLISHED VERSION, not per container) or
+  ;;    with many invocations per container. Do not enable it blind.
+  ;;
+  ;; 3. JVM INIT is 238ms cold, which is good for Clojure and means SnapStart's
+  ;;    value here is mostly the WARM STATE, not the JVM boot.
+  ;;
+  ;; 4. Steady-state writes through the writer function: 1-2 PUTs at 50-70ms,
+  ;;    confirming the 1.00 PUT/commit claim on the Lambda path. A tenant's FIRST
+  ;;    write is ~16 PUTs (create-database + schema + migrations), not steady state.
+  ;;
+  ;; OPEN BUG: the reader reports 2 PUTs on first tenant open. A read replica must
+  ;; not write; likely ensure-schema!/migrations running in the reader's pool.
+  :open-bug "reader performs 2 PUTs on first tenant open"}}
+
+;; ── pg-datahike: an UNMODIFIED psycopg app over object storage ────────────
+;; docker compose --profile tier5-pg up -d minio pg-server
+;; docker compose --profile tier5-pg run --rm pybench
+;;
+;; A tenant IS a PG database name — postgresql://pg-server:5432/acme routes to
+;; that tenant's conn (pg/start-server takes a {name -> conn} registry). So
+;; db-per-tenant needs no WHERE tenant_id and no schema-per-tenant trick, and the
+;; client is a stock psycopg app that knows none of it.
+;;
+;; This is the COMPONENT measurement under the Lambda-extension shape (Python
+;; handler + JVM extension sharing localhost). It is not a Lambda emulation —
+;; though RIE does proxy the Extensions API, so the full packaging is simulable.
+{:tier5-pg
+ {:boot {:total-ms 1736 :tenant-open-ms 1505}   ; JVM + pool + tenant + wire bind
+  :client
+  {:connect+first-roundtrip-ms 516.84
+   :insert     {:n 50 :p50-ms 46.44 :p95-ms 73.47}   ; = the S3 commit (1 PUT) + translation
+   :count-star {:first-ms 66.48}
+   :select-pk  {:n 50 :p50-ms 6.92 :p95-ms 9.04}
+   :select-scan-limit-20 {:p50-ms 2.87}}
+
+  ;; 1. WARM SQL is single-digit ms through the whole stack: psycopg -> wire
+  ;;    protocol -> SQL translation -> datahike -> warm node cache. Usable.
+  ;; 2. INSERT at 46ms p50 matches the writer Lambda's measured 50-70ms for the
+  ;;    same commit, so the SQL path adds little over the native one.
+  ;; 3. Boot is 1.7s, of which 1.5s is opening the tenant — NOT the JVM (238ms
+  ;;    measured separately). That is the number SnapStart would amortise, and the
+  ;;    one the warm work targets.
+  ;; 4. Scans beat point lookups (2.87 vs 6.92) — same warm nodes, less
+  ;;    translation per row.
+  ;;
+  ;; Supports the session argument: ~2s once when a user starts interacting, then
+  ;; single-digit ms while they do. Bad as an API SLA, fine for a niche app.
+  }}
+
+;; ── Tier 5 polyglot: Python handler + JVM extension, ONE Lambda env ───────
+;; Verified end-to-end against RIE + MinIO. An unmodified psycopg handler talking
+;; SQL to Datahike over object storage; pg-datahike runs as an EXTERNAL EXTENSION
+;; in the same execution environment, so 127.0.0.1:5432 is a JVM, not a Postgres.
+{:tier5-polyglot
+ {:extension-init {:pool-ms 51 :open-ms 3070 :warm-ms 0 :bind-ms 4190 :total-ms 7311}
+  :handler {:lazy-connect-ms 265 :first-read-ms 396.75
+            :write-20-notes-ms 2349.94    ; 20x (DELETE + INSERT), ~59ms/statement
+            :warm-read-ms 8.52}
+
+  ;; 1. The connection MUST be lazy. Function init has a hard ~10s budget, and
+  ;;    Extension init runs CONCURRENTLY with Runtime init -- Lambda waits for both
+  ;;    to signal Next but does not hold the runtime while an extension boots. A
+  ;;    module-level connect therefore both races the JVM and then blocks init
+  ;;    waiting for it, against a 7.3s extension boot. This killed every earlier
+  ;;    run. It is an AWS requirement, not a local artefact.
+  ;;
+  ;; 2. RIE is FAITHFUL here, contrary to an earlier note in this file's history:
+  ;;    it enables extensions by default (rie/run.go SetExtensionsFlag(true)) and
+  ;;    runs doInitExtensions before doRuntimeBootstrap (rapid/handlers.go). It
+  ;;    embeds the same `rapid` orchestrator. What it does NOT do is forward agent
+  ;;    stdout -- so probe the socket for readiness, never `docker logs | grep`.
+  ;;
+  ;; 3. bind=4190ms is the largest single term and is UNEXAMINED. Binding a socket
+  ;;    is microseconds; this is pg-datahike building its SQL translator and pg_*
+  ;;    catalogs. Likely both lazy-able and the most SnapStart-amortisable part.
+  ;;
+  ;; 4. UPSTREAM BUG found here: `INSERT ... ON CONFLICT` with PARAMETERS fails --
+  ;;    "class datahike.pg.sql.params.ParamRef cannot be cast to java.lang.Number".
+  ;;    Isolated: plain INSERT + params OK; ON CONFLICT + literals OK; ON CONFLICT
+  ;;    + params FAILS. The example uses DELETE + plain INSERT until it is fixed.
+  ;;    Matters because every ORM emits parameterised upserts.
+  :open "bind=4190ms unprofiled; pg-datahike ON CONFLICT + params bug"}}
+
+;; ── CORRECTION to :tier5-polyglot's bind=4190ms ───────────────────────────
+;; Measured directly: pg/start-server takes 23ms on a cold JVM and 1ms on repeat
+;; calls in the same process. So the 4190ms was NOT the server starting -- it was
+;; `requiring-resolve` loading the pg-datahike namespace tree, timed inside the
+;; same block. The instrumentation now splits load= from bind=.
+;;
+;; This changes the fix. Class loading is not lazy-able (you need the code to
+;; serve SQL) but it is exactly what a heap snapshot removes:
+;;   - SnapStart / native-image: the right levers
+;;   - restructuring pg-datahike: NOT the lever; there is no eager catalog build
+;;   - Cloud Run: also fine, since a long-lived container pays it once
+;; And it explains why the Clojure-only Lambda path is 238ms: no pg-datahike load.
+{:tier5-polyglot-correction
+ {:start-server-ms {:cold 23 :warm 1}
+  :was-mislabelled "bind=4190ms was namespace/class loading, not socket bind"}}
