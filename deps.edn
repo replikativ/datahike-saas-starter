@@ -94,26 +94,6 @@
                       :exec-fn     cognitect.test-runner.api/test
                       :exec-args   {:dirs ["test-integration-tier4"]}}
 
-  ;; ── Tier 5: AWS Lambda ────────────────────────────────────────────────────
-  ;; The same app served from a function instead of a port (kernel/lambda.clj).
-  ;; Only the AWS runtime interface is extra — jsonista arrives via muuntaja.
-  ;;   clj -T:build uber      # uberjar for the Lambda java runtime
-  ;;   docker compose --profile tier5 up --build
-  :lambda {:extra-deps {com.amazonaws/aws-lambda-java-core {:mvn/version "1.2.3"}}}
-
-  ;; Uberjar build. AOT is REQUIRED, not an optimisation: the Lambda java runtime
-  ;; loads a handler CLASS, and kernel/lambda.clj only becomes one via :gen-class.
-  :build {:extra-deps {io.github.clojure/tools.build {:mvn/version "0.10.5"}
-                       com.amazonaws/aws-lambda-java-core {:mvn/version "1.2.3"}}
-          :ns-default build}
-
-  ;; ── pg-datahike: the tenant pool as a PostgreSQL server ───────────────────
-  ;; A tenant IS a PG database name — `postgresql://host/acme` routes to that
-  ;; tenant's conn, so an unmodified SQL client gets db-per-tenant for free.
-  ;;   docker compose --profile tier5-pg up --build
-  :pg {:extra-paths ["bench"]
-       :extra-deps  {org.replikativ/pg-datahike {:mvn/version "0.1.62"}}}
-
   :format {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
            :main-opts  ["-m" "cljfmt.main" "check" "src" "bench" "test" "test-integration" "test-integration-tier4" "dev"]}
   :ffix   {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
