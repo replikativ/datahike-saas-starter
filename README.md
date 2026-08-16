@@ -206,6 +206,14 @@ Odoo, Flyway) talk to it with no Postgres install. Point it at the store profile
 result is **db-per-tenant Postgres on object storage**, scaling horizontally the same way — you
 keep your ORM and your migrations.
 
+**No server at all?** [**datahike-serverless**](https://github.com/replikativ/datahike-serverless)
+is the same store on ephemeral compute — AWS Lambda first, with Cloud Run and Fly as sibling
+profiles. It is the opposite trade to the ladder here: a tenant that nobody touches costs
+*storage only*, and you pay the cold start instead of an instance. Worth reading its
+measurements before choosing — the crossover is real, and **small tenants like this
+template's need none of it** (at 5 issues the fused db record *is* the database: 1 GET, zero
+node reads, [§7](doc/benchmarks.md)). Cold start is a big-single-database problem.
+
 **Your storage isn't S3?** The `:store` is just a [konserve](https://github.com/replikativ/konserve)
 backend, and there are many: **GCS**, **JDBC**, DynamoDB, Redis, RocksDB, LevelDB, LMDB, the
 filesystem, in-memory. Anything with similar economics slots into the same four-tier story, and
