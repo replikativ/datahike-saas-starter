@@ -19,7 +19,8 @@
 (defn file-conn-fixture [f]
   (let [dir (io/file (System/getProperty "java.io.tmpdir")
                      (str "dh-saas-att-" (random-uuid)))
-        cfg {:store {:backend :file :path (.getPath dir) :id (random-uuid)}
+        cfg {:value-caps :default
+             :store {:backend :file :path (.getPath dir) :id (random-uuid)}
              :keep-history? false}]
     (d/create-database cfg)
     (let [conn (schema/ensure-schema! (d/connect cfg))]

@@ -32,6 +32,22 @@
  ;;                         warm scans are unaffected, and there are NO extra object-store reads.
  ;;                         Create-time-fixed (irreversible). Newest of the three — promising, but
  ;;                         wants more testing before calling it stable.
+ ;; Value-size caps (datahike 0.8.1779+). :default is the Datomic-parity set —
+ ;; strings 4096 chars, bytes / float-array / double-array 4096, string slots inside
+ ;; a tuple 256. Opt-in upstream; datahike warns on every write without them.
+ ;;
+ ;; Set here rather than silenced because the cap points at the design this template
+ ;; already argues for: a datom value is for SMALL data, and anything large belongs
+ ;; out-of-line as a `:db.type/store-ref` blob, which the GC then marks
+ ;; (doc/blobs.md). Caps do not apply to store-refs, so the attachment path is
+ ;; unaffected — a 40 MB screenshot is fine; a 40 MB string is the thing you wanted
+ ;; to be told about, because it lands INSIDE the index and every reader of that
+ ;; node pays for it.
+ ;;
+ ;; 4096 chars is roughly a page of prose. If your domain genuinely needs longer
+ ;; text in a datom, raise :max-string-length explicitly rather than dropping the
+ ;; caps — `:max-string-length 0` disables just that one and keeps the rest.
+ :value-caps        :default
  :keep-history?     false
  :fuse-index-roots? true
  :commit-graph?     false
